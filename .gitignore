@@ -1,0 +1,15 @@
+# Local / runtime files
+_backups/
+node_modules/
+PENDING_CHANGES.md
+PROJECT_LOG.md
+TESTING.md
+*.log
+*.tmp
+*.zip
+*.bak
+*.dat
+.env
+.env.*
+Thumbs.db
+.DS_Store
