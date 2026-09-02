@@ -30,7 +30,10 @@ jobs:
             exit 1
           fi
           echo "运行时文件检查通过 ✓"
-      - run: npm test
+      - name: 自动测试（对齐用户本机东八区语义）
+        env:
+          TZ: Asia/Shanghai
+        run: npm test
       - name: 命名红线检查
         run: |
           if git grep -n -I -E "玥儿|绯月|雪奈|悠米|柚月|星眠" -- . ':(exclude).github/workflows/ci.yml'; then

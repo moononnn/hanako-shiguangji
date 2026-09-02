@@ -1,5 +1,10 @@
 // 拾光记 · 核心测试
 // 覆盖：加密存储、注入判定、节假日、数据层（事件/生理期/待办）
+//
+// 生活日边界（凌晨翻篇）按用户本机日期语义工作。测试用固定 +08:00 时刻表达
+// “东八区用户的一天”，因此在任何 runner（含 UTC 的 CI）上都固定东八区，避免
+// 无时区日期字符串被按 runner 时区解析而错位。
+process.env.TZ = "Asia/Shanghai";
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
