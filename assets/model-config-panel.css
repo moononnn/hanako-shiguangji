@@ -1,0 +1,156 @@
+/* model-config · ui/model-config-panel.css — 模型配置弹窗（基础版）
+   插件可自行覆盖样式；颜色用 CSS 变量兜底，插件没定义时用默认值 */
+
+.mc-open-btn {
+  padding: 6px 14px;
+  border: 1px solid var(--mc-border, #d8c9b5);
+  border-radius: 8px;
+  background: var(--mc-btn-bg, #faf6ef);
+  color: var(--mc-text, #5a4a3a);
+  font-size: 13px;
+  cursor: pointer;
+}
+.mc-open-btn:hover { background: var(--mc-btn-hover, #f3ecdf); }
+
+.mc-modal {
+  position: fixed;
+  inset: 0;
+  z-index: 9999;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.mc-modal[hidden] { display: none; }
+
+.mc-modal-mask {
+  position: absolute;
+  inset: 0;
+  background: rgba(40, 32, 24, 0.45);
+}
+
+.mc-modal-panel {
+  position: relative;
+  width: min(440px, calc(100vw - 40px));
+  max-height: 82vh;
+  display: flex;
+  flex-direction: column;
+  background: var(--mc-panel-bg, #fffdf8);
+  border: 1px solid var(--mc-border, #e2d6c4);
+  border-radius: 12px;
+  box-shadow: 0 8px 30px rgba(60, 45, 25, 0.18);
+  overflow: hidden;
+}
+
+.mc-modal-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 12px 16px;
+  border-bottom: 1px solid var(--mc-border, #eee3d3);
+}
+.mc-modal-title { font-size: 15px; font-weight: 600; color: var(--mc-text, #5a4a3a); }
+.mc-modal-close {
+  border: none;
+  background: none;
+  font-size: 18px;
+  line-height: 1;
+  color: var(--mc-text-light, #a08d74);
+  cursor: pointer;
+  padding: 2px 6px;
+}
+.mc-modal-close:hover { color: var(--mc-text, #5a4a3a); }
+
+.mc-modal-body { padding: 14px 16px; overflow-y: auto; }
+
+/* 当前使用状态行：重启后一眼看出选的是哪档 */
+.mc-current {
+  margin-bottom: 12px;
+  padding: 7px 10px;
+  border-left: 3px solid var(--mc-accent, #c9a87c);
+  background: var(--mc-accent-bg, #faf3e8);
+  border-radius: 6px;
+  font-size: 12px;
+  color: var(--mc-text, #5a4a3a);
+}
+
+.mc-source-list { display: flex; flex-direction: column; gap: 8px; margin-bottom: 14px; }
+.mc-source-option {
+  display: block;
+  position: relative;
+  padding: 9px 12px;
+  border: 1px solid var(--mc-border, #e2d6c4);
+  border-radius: 8px;
+  cursor: pointer;
+  transition: border-color .15s, background .15s;
+}
+.mc-source-option.active {
+  border-color: var(--mc-accent, #c9a87c);
+  background: var(--mc-accent-bg, #faf3e8);
+  padding-right: 30px;
+}
+.mc-source-option.active::before {
+  content: '✓';
+  position: absolute;
+  right: 11px;
+  top: 50%;
+  transform: translateY(-50%);
+  color: var(--mc-accent, #c9a87c);
+  font-weight: 700;
+  font-size: 13px;
+}
+.mc-source-name { display: block; font-size: 13px; font-weight: 600; color: var(--mc-text, #5a4a3a); }
+.mc-source-desc { display: block; margin-top: 2px; font-size: 11px; color: var(--mc-text-light, #a08d74); }
+
+.mc-form { display: flex; flex-direction: column; gap: 10px; }
+.mc-field { display: flex; flex-direction: column; gap: 4px; font-size: 12px; color: var(--mc-text, #5a4a3a); }
+.mc-field input,
+.mc-field select {
+  padding: 7px 10px;
+  border: 1px solid var(--mc-border, #e2d6c4);
+  border-radius: 6px;
+  background: var(--mc-input-bg, #fff);
+  color: var(--mc-text, #5a4a3a);
+  font-size: 13px;
+  width: 100%;
+  box-sizing: border-box;
+}
+.mc-field input:focus,
+.mc-field select:focus {
+  outline: none;
+  border-color: var(--mc-accent, #c9a87c);
+}
+.mc-hint { margin: 0; font-size: 11px; color: var(--mc-text-light, #a08d74); line-height: 1.6; }
+.mc-link-btn {
+  align-self: flex-start;
+  border: none;
+  background: none;
+  padding: 0;
+  font-size: 11px;
+  color: var(--mc-accent, #c9a87c);
+  text-decoration: underline;
+  cursor: pointer;
+}
+.mc-link-btn:hover { color: var(--mc-accent-hover, #bb9768); }
+
+.mc-modal-foot {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 12px 16px;
+  border-top: 1px solid var(--mc-border, #eee3d3);
+}
+.mc-foot-spacer { flex: 1; }
+.mc-btn {
+  padding: 7px 16px;
+  border-radius: 8px;
+  border: 1px solid var(--mc-border, #e2d6c4);
+  background: var(--mc-btn-bg, #faf6ef);
+  color: var(--mc-text, #5a4a3a);
+  font-size: 13px;
+  cursor: pointer;
+}
+.mc-btn:hover { background: var(--mc-btn-hover, #f3ecdf); }
+.mc-btn:disabled { opacity: .6; cursor: default; }
+.mc-btn-save { background: var(--mc-accent, #c9a87c); border-color: var(--mc-accent, #c9a87c); color: #fff; }
+.mc-btn-save:hover { background: var(--mc-accent-hover, #bb9768); }
+.mc-test-result { font-size: 12px; color: var(--mc-text, #5a4a3a); max-width: 160px; }

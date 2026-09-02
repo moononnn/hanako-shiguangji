@@ -1,0 +1,14 @@
+{
+  "name": "feedback",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "插件积木箱 · feedback：专职反馈小助手（聊天收集 + 环境信息 + issue 草稿 + 预填页）",
+  "scripts": {
+    "test": "node --test tests/*.test.js"
+  },
+  "main": "./index.js",
+  "engines": {
+    "node": ">=18"
+  }
+}

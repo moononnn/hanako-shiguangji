@@ -1,0 +1,14 @@
+{
+  "name": "update-checker",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "插件积木箱 · update-checker：检查更新（GitHub releases + 版本对比 + 缓存降级）",
+  "scripts": {
+    "test": "node --test tests/*.test.js"
+  },
+  "main": "./index.js",
+  "engines": {
+    "node": ">=18"
+  }
+}

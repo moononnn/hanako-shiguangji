@@ -1,0 +1,194 @@
+/* feedback · ui/feedback.css — 反馈小助手聊天窗（基础版）
+   插件可自行覆盖样式 */
+
+.fb-open-btn {
+  padding: 6px 14px;
+  border: 1px solid var(--fb-border, #d8c9b5);
+  border-radius: 8px;
+  background: var(--fb-btn-bg, #faf6ef);
+  color: var(--fb-text, #5a4a3a);
+  font-size: 13px;
+  cursor: pointer;
+}
+.fb-open-btn:hover { background: var(--fb-btn-hover, #f3ecdf); }
+
+.fb-modal {
+  position: fixed;
+  inset: 0;
+  z-index: 9999;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.fb-modal[hidden] { display: none; }
+
+.fb-modal-mask {
+  position: absolute;
+  inset: 0;
+  background: rgba(40, 32, 24, 0.45);
+}
+
+.fb-modal-panel {
+  position: relative;
+  width: min(460px, calc(100vw - 40px));
+  max-height: 84vh;
+  display: flex;
+  flex-direction: column;
+  background: var(--fb-panel-bg, #fffdf8);
+  border: 1px solid var(--fb-border, #e2d6c4);
+  border-radius: 12px;
+  box-shadow: 0 8px 30px rgba(60, 45, 25, 0.18);
+  overflow: hidden;
+}
+
+.fb-modal-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 12px 16px;
+  border-bottom: 1px solid var(--fb-border, #eee3d3);
+}
+.fb-modal-titles { display: flex; flex-direction: column; gap: 2px; }
+.fb-modal-title { font-size: 15px; font-weight: 600; color: var(--fb-text, #5a4a3a); }
+.fb-modal-sub { font-size: 11px; color: var(--fb-text-light, #a08d74); }
+.fb-modal-close {
+  border: none;
+  background: none;
+  font-size: 18px;
+  line-height: 1;
+  color: var(--fb-text-light, #a08d74);
+  cursor: pointer;
+  padding: 2px 6px;
+}
+.fb-modal-close:hover { color: var(--fb-text, #5a4a3a); }
+
+.fb-messages {
+  flex: 1;
+  overflow-y: auto;
+  padding: 14px 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-height: 180px;
+  max-height: 40vh;
+}
+.fb-welcome {
+  font-size: 12px;
+  color: var(--fb-text-light, #a08d74);
+  line-height: 1.7;
+  white-space: pre-line;
+  text-align: center;
+  margin: 10px 0;
+}
+.fb-bubble {
+  max-width: 82%;
+  padding: 8px 12px;
+  border-radius: 10px;
+  font-size: 13px;
+  line-height: 1.6;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.fb-bubble-user {
+  align-self: flex-end;
+  background: var(--fb-user-bg, #f3e9d8);
+  color: var(--fb-text, #5a4a3a);
+}
+.fb-bubble-assistant {
+  align-self: flex-start;
+  background: var(--fb-assistant-bg, #f5f1ea);
+  border: 1px solid var(--fb-border, #e8dcc9);
+  color: var(--fb-text, #5a4a3a);
+}
+.fb-bubble-thinking { align-self: flex-start; font-size: 12px; color: var(--fb-text-light, #a08d74); }
+.fb-bubble-error { align-self: flex-start; font-size: 12px; color: #b3543f; }
+
+.fb-issue-preview {
+  margin: 0 16px 10px;
+  padding: 10px 12px;
+  border: 1px dashed var(--fb-accent, #c9a87c);
+  border-radius: 8px;
+  background: var(--fb-accent-bg, #faf3e8);
+  font-size: 12px;
+  line-height: 1.6;
+  color: var(--fb-text, #5a4a3a);
+  max-height: 32vh;
+  overflow-y: auto;
+}
+.fb-preview-title { font-weight: 600; margin-bottom: 6px; }
+.fb-preview-item { margin-top: 4px; }
+.fb-preview-item ol { margin: 4px 0 0 18px; padding: 0; }
+.fb-preview-env { margin-top: 6px; }
+.fb-preview-env summary { cursor: pointer; color: var(--fb-text-light, #a08d74); }
+.fb-preview-env pre {
+  margin: 6px 0 0;
+  font-size: 11px;
+  white-space: pre-wrap;
+  word-break: break-all;
+  color: var(--fb-text-light, #8a7a66);
+}
+
+.fb-input-row {
+  display: flex;
+  gap: 8px;
+  padding: 10px 16px;
+  border-top: 1px solid var(--fb-border, #eee3d3);
+}
+.fb-input-row textarea {
+  flex: 1;
+  min-width: 0;
+  resize: none;
+  padding: 8px 10px;
+  border: 1px solid var(--fb-border, #e2d6c4);
+  border-radius: 8px;
+  background: var(--fb-input-bg, #fff);
+  color: var(--fb-text, #5a4a3a);
+  font-size: 13px;
+  font-family: inherit;
+  box-sizing: border-box;
+}
+.fb-input-row textarea:focus { outline: none; border-color: var(--fb-accent, #c9a87c); }
+.fb-send-btn {
+  padding: 8px 16px;
+  border: none;
+  border-radius: 8px;
+  background: var(--fb-accent, #c9a87c);
+  color: #fff;
+  font-size: 13px;
+  cursor: pointer;
+  align-self: stretch;
+}
+.fb-send-btn:disabled { opacity: .6; cursor: default; }
+.fb-send-btn:hover:not(:disabled) { background: var(--fb-accent-hover, #bb9768); }
+
+.fb-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 16px;
+  border-top: 1px solid var(--fb-border, #eee3d3);
+  flex-wrap: wrap;
+}
+.fb-actions[hidden] { display: none; }
+.fb-btn {
+  padding: 7px 14px;
+  border: 1px solid var(--fb-border, #e2d6c4);
+  border-radius: 8px;
+  background: var(--fb-btn-bg, #faf6ef);
+  color: var(--fb-text, #5a4a3a);
+  font-size: 13px;
+  cursor: pointer;
+}
+.fb-btn:hover { background: var(--fb-btn-hover, #f3ecdf); }
+.fb-btn-primary { background: var(--fb-accent, #c9a87c); border-color: var(--fb-accent, #c9a87c); color: #fff; }
+.fb-btn-primary:hover { background: var(--fb-accent-hover, #bb9768); }
+.fb-actions-hint { font-size: 11px; color: var(--fb-text-light, #a08d74); }
+
+@media (max-height: 600px) {
+  .fb-modal-panel { max-height: calc(100vh - 24px); }
+  .fb-modal-head { padding: 8px 14px; }
+  .fb-messages { min-height: 88px; max-height: 24vh; padding: 10px 14px; }
+  .fb-issue-preview { max-height: 22vh; margin-left: 14px; margin-right: 14px; }
+  .fb-input-row, .fb-actions { padding-left: 14px; padding-right: 14px; }
+}
