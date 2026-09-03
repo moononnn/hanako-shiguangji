@@ -12,6 +12,7 @@ import { getBuiltinFestivals, isWorkday, getMonthFestivals } from "../lib/festiv
 import { ModelConfig } from "../lib/model-config/index.js";
 import { buildInjectionText } from "../lib/inject.js";
 import {
+  configureWeatherNetwork,
   getWeatherForInject,
   normalizeWeatherResult,
   resolveWeatherLocation,
@@ -222,6 +223,8 @@ function normalizeSummaryOutput(value, userName) {
 }
 
 export default function registerRoutes(app, ctx) {
+  // 页面路由拿得到插件 ctx；把宿主网络能力交给扩展的后台天气刷新复用。
+  const weatherFetcher = configureWeatherNetwork(ctx?.network);
   const mc = new ModelConfig({ ctx, store: makeSettingsStore() });
   mcInstance = mc;
 
@@ -433,6 +436,7 @@ export default function registerRoutes(app, ctx) {
         location: config.location,
         coordinates: config.coordinates,
         now: new Date(),
+        fetcher: weatherFetcher,
       });
       return c.json({ ok: true, weather: weather || null });
     } catch (e) {
@@ -458,6 +462,7 @@ export default function registerRoutes(app, ctx) {
         location,
         coordinates: area ? { latitude: area.latitude, longitude: area.longitude } : undefined,
         now: new Date(),
+        fetcher: weatherFetcher,
         noCache: true,
       });
       if (!weather) return c.json({ ok: false, error: "没查到天气，检查网络" });

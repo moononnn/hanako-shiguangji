@@ -190,7 +190,15 @@ test("路由：情境注入与天气开关独立保存，关闭天气不查询�
     };
     const data = new UserData(path.join(process.env.HANA_HOME, "plugin-data", "shiguangji"));
     __setSharedUserDataForTest(data);
-    registerRoutes(app, { log: { info() {}, warn() {}, error() {} } });
+    let fetches = 0;
+    let weatherResponse = async () => { throw new Error("关闭天气时不应查询"); };
+    const network = {
+      async fetch(url, init) {
+        fetches++;
+        return weatherResponse(url, init);
+      },
+    };
+    registerRoutes(app, { network, log: { info() {}, warn() {}, error() {} } });
     const getSettings = routes.find((item) => item.method === "GET" && item.path === "/api/settings");
     const postSettings = routes.find((item) => item.method === "POST" && item.path === "/api/settings");
     const currentWeather = routes.find((item) => item.method === "GET" && item.path === "/api/weather/current");
@@ -216,9 +224,6 @@ test("路由：情境注入与天气开关独立保存，关闭天气不查询�
       fetchedAt: Date.now(),
       result: { place: "四川省 成都市 武侯区", line: "晴空万里，28°C", temp: 28, code: 0, isDay: true },
     });
-    let fetches = 0;
-    const oldFetch = globalThis.fetch;
-    globalThis.fetch = async () => { fetches++; throw new Error("关闭天气时不应查询"); };
     const disabledWeather = await currentWeather.handler({ json(value) { return value; } });
     if (!disabledWeather.ok || disabledWeather.weather !== null || fetches !== 0) {
       throw new Error("关闭天气后仍查询或回显天气：" + JSON.stringify({ disabledWeather, fetches }));
@@ -239,23 +244,18 @@ test("路由：情境注入与天气开关独立保存，关闭天气不查询�
     if (!disabledPreview.ok || !String(disabledPreview.text).includes("已关闭")) {
       throw new Error("关闭注入后的预览没有诚实提示：" + JSON.stringify(disabledPreview));
     }
-    globalThis.fetch = oldFetch;
     const restored = await callSettings({ injectionEnabled: true, weatherEnabled: true });
     if (!restored.ok || restored.settings.injectionEnabled !== true || restored.settings.weatherEnabled !== true) {
       throw new Error("重新打开开关失败：" + JSON.stringify(restored));
     }
     // 重新开启会主动绕过旧缓存，这里用确定的天气响应验证确实查了最新结果。
-    globalThis.fetch = async () => {
-      fetches++;
-      return {
-        ok: true,
-        async json() {
-          return { current: { temperature_2m: 28, weather_code: 0, is_day: 1, time: new Date().toISOString() } };
-        },
-      };
-    };
+    weatherResponse = async () => ({
+      ok: true,
+      async json() {
+        return { current: { temperature_2m: 28, weather_code: 0, is_day: 1, time: new Date().toISOString() } };
+      },
+    });
     const enabledWeather = await currentWeather.handler({ json(value) { return value; } });
-    globalThis.fetch = oldFetch;
     if (!enabledWeather.ok || !enabledWeather.weather || enabledWeather.weather.temp !== 28 || fetches !== 1) {
       throw new Error("天气重新打开后没有立即查最新结果：" + JSON.stringify({ enabledWeather, fetches }));
     }
@@ -895,6 +895,14 @@ test("页面 API：已有查询参数时用 & 追加鉴权 token", async () => {
   assert.ok(script, "页面主脚本应包含 api helper");
   assert.match(script, /var tokenSep = path\.indexOf\('\?'\) >= 0 \? '&' : '\?'\;/);
   assert.match(script, /tokenSep \+ 'token='/);
+});
+
+test("检查更新：未点击前不显示手动仓库地址框", async () => {
+  const { renderPage } = await import("../lib/page-template.js");
+  const html = renderPage("test-token");
+  assert.match(html, /id="uc-check-btn">检查更新<\/button>/);
+  assert.match(html, /id="uc-result"/);
+  assert.doesNotMatch(html, /uc-manual|uc-copy|自动检查暂不可用/);
 });
 
 test("日历：页面具备选中日期的即时状态", async () => {

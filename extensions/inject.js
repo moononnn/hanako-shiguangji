@@ -14,6 +14,7 @@ import { FESTIVAL_HINTS, pickFestivalHint } from "../lib/festival-hints.js";
 import { finishedLifeDayKey, resolveSummaryAgentId } from "../lib/day-summary.js";
 import { readHanaUserName } from "../lib/user-name.js";
 import {
+  getConfiguredWeatherFetcher,
   getWeatherForInject,
   normalizeWeatherResult,
   resolveWeatherLocation,
@@ -295,12 +296,15 @@ function startWeatherRefresher() {
       const now = Date.now();
       // 缓存有效（同地点 + 未过期）→ 不用查；旧地点文字也能命中
       if (weatherCacheMatches(cache, settings) && now - cache.fetchedAt < intervalMs) return;
-      // 过期/没有 → 后台查（失败静默，下次再试）
+      // 过期/没有 → 后台查（失败静默，下次再试）。没有宿主网络能力时不出网。
+      const fetcher = getConfiguredWeatherFetcher();
+      if (typeof fetcher !== "function") return;
       getWeatherForInject({
         data,
         location: loc,
         coordinates: weatherConfig.coordinates,
         now: new Date(now),
+        fetcher,
       })
         .then((r) => {
           if (r) {
