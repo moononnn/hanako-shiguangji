@@ -146,7 +146,7 @@ node --test tests/*.test.js
 Get-ChildItem -Recurse -Filter *.js | ForEach-Object { node --check $_.FullName }
 ```
 
-当前版本最近一次自动测试结果：`167/167` 通过。
+当前版本最近一次自动测试结果：`170/170` 通过。
 
 ## 致谢
 
