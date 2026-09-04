@@ -16,6 +16,7 @@ import {
   getWeatherForInject,
   normalizeWeatherResult,
   resolveWeatherLocation,
+  weatherCacheIsFresh,
   weatherCacheMatches,
 } from "../lib/weather.js";
 import {
@@ -295,7 +296,8 @@ export default function registerRoutes(app, ctx) {
       ? data.listEvents().filter((e) => isTodoOverdue(e, todayDate))
       : [];
     const weatherCache = dk === today ? data.getWeatherCache() : null;
-    const weather = dk === today && settings.weatherEnabled !== false && weatherCacheMatches(weatherCache, settings)
+    const weather = dk === today && settings.weatherEnabled !== false &&
+      weatherCacheMatches(weatherCache, settings) && weatherCacheIsFresh(weatherCache, settings, todayDate)
       ? normalizeWeatherResult(weatherCache.result)
       : null;
     return c.json({
@@ -506,8 +508,9 @@ export default function registerRoutes(app, ctx) {
         }
       }
       const cached = data.getWeatherCache();
-      const weather = settings.weatherEnabled !== false && weatherCacheMatches(cached, settings)
-        ? cached.result || null
+      const weather = settings.weatherEnabled !== false &&
+        weatherCacheMatches(cached, settings) && weatherCacheIsFresh(cached, settings, now)
+        ? normalizeWeatherResult(cached.result)
         : null;
       const text = buildInjectionText({
         now,

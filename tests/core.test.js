@@ -40,6 +40,7 @@ import {
   getWeatherForInject,
   normalizeWeatherResult,
   translateWeatherToMood,
+  weatherCacheIsFresh,
   weatherCacheMatches,
 } from "../lib/weather.js";
 import {
@@ -540,7 +541,7 @@ test("天气：旧版成都+区配置自动使用匹配区县坐标，旧缓存�
   let calls = 0;
   const data = {
     getSettings() { return { weatherLocation: "成都 武侯区", weatherIntervalHours: 3 }; },
-    getWeatherCache() { return { location: "成都 武侯区", fetchedAt: Date.now(), result: { place: "成都 武侯区", line: "旧缓存", temp: 25 } }; },
+    getWeatherCache() { return { location: "成都 武侯区", fetchedAt: Date.now() - 1000, result: { place: "成都 武侯区", line: "旧缓存", temp: 25 } }; },
     async setWeatherCache() { throw new Error("不应写入有效缓存"); },
   };
   assert.equal(weatherCacheMatches(data.getWeatherCache(), data.getSettings()), true);
@@ -570,6 +571,17 @@ test("天气：旧版成都+区配置自动使用匹配区县坐标，旧缓存�
   assert.equal(urls.length, 1);
   assert.match(urls[0], new RegExp("latitude=" + region.latitude));
   assert.match(urls[0], new RegExp("longitude=" + region.longitude));
+});
+
+test("天气：过期或未来时间的缓存都不能当作当前天气", () => {
+  const now = new Date("2026-09-04T20:00:00+08:00");
+  const fresh = { fetchedAt: now.getTime() - 2 * 3600 * 1000, result: { line: "晴朗" } };
+  const expired = { fetchedAt: now.getTime() - 4 * 3600 * 1000, result: { line: "晴空万里，阳光正好" } };
+  const future = { fetchedAt: now.getTime() + 60 * 1000, result: { line: "晴空万里，阳光正好" } };
+  assert.equal(weatherCacheIsFresh(fresh, { weatherIntervalHours: 3 }, now), true);
+  assert.equal(weatherCacheIsFresh(expired, { weatherIntervalHours: 3 }, now), false);
+  assert.equal(weatherCacheIsFresh(future, { weatherIntervalHours: 3 }, now), false);
+  assert.equal(weatherCacheIsFresh({ fetchedAt: now.getTime(), result: null }, { weatherIntervalHours: 3 }, now), false);
 });
 
 // ── 节假日 ──

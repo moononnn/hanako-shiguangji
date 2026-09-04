@@ -93,6 +93,32 @@ test("扩展：天气关闭时仍可注入其他情境但不带天气", async ()
   __setSharedUserDataForTest(new UserData(TEST_DATA_DIR));
 });
 
+test("扩展：过期天气缓存不进入今日情境", async () => {
+  const data = new UserData(path.join(os.tmpdir(), `sgj-stale-weather-ext-${Date.now()}-${Math.random().toString(36).slice(2)}`));
+  __setSharedUserDataForTest(data);
+  const now = new Date();
+  await data.updateSettings({
+    weatherLocation: "河北省 邢台市 襄都区",
+    weatherArea: { code: "130502" },
+    weatherIntervalHours: 3,
+  });
+  await data.addEvent({ title: "过期天气回归锚点", type: "event", date: dateKey(now) });
+  await data.setWeatherCache({
+    location: "河北省 邢台市 襄都区",
+    fetchedAt: Date.now() - 4 * 3600 * 1000,
+    result: { place: "河北省 邢台市 襄都区", line: "晴空万里，阳光正好，30°C", temp: 30, code: 0, isDay: true },
+  });
+  const pi = makePi();
+  registerShiguangjiInject(pi);
+  const result = pi._handlers["before_agent_start"]({}, {
+    sessionManager: { getSessionId: () => `stale-weather-session-${Date.now()}` },
+  });
+  assert.ok(result?.message, "今天的日子仍应触发情境注入");
+  assert.ok(!result.message.content.includes("窗外"), "过期天气不能继续进入今日情境");
+  assert.ok(!result.message.content.includes("阳光正好"), "过期的白天文案不能出现在当前情境");
+  __setSharedUserDataForTest(new UserData(TEST_DATA_DIR));
+});
+
 test("扩展：未来待办不提前进入今日情境，旧 MM-DD 也按完整日期判断", async () => {
   const data = new UserData(path.join(os.tmpdir(), `sgj-future-todo-ext-${Date.now()}-${Math.random().toString(36).slice(2)}`));
   __setSharedUserDataForTest(data);

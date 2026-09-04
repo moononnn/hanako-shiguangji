@@ -18,6 +18,7 @@ import {
   getWeatherForInject,
   normalizeWeatherResult,
   resolveWeatherLocation,
+  weatherCacheIsFresh,
   weatherCacheMatches,
 } from "../lib/weather.js";
 import { logInfo } from "../lib/debug-log.js";
@@ -166,7 +167,11 @@ export default function registerShiguangjiInject(pi) {
       let weather = null;
       try {
         const wc = data.getWeatherCache();
-        if (settings.weatherEnabled !== false && weatherCacheMatches(wc, settings)) {
+        if (
+          settings.weatherEnabled !== false &&
+          weatherCacheMatches(wc, settings) &&
+          weatherCacheIsFresh(wc, settings, now)
+        ) {
           weather = normalizeWeatherResult(wc.result);
         }
       } catch {
@@ -292,10 +297,9 @@ function startWeatherRefresher() {
       const loc = weatherConfig.location;
       if (!loc) return; // 没配置就不查
       const cache = data.getWeatherCache();
-      const intervalMs = (settings.weatherIntervalHours || 3) * 3600 * 1000;
-      const now = Date.now();
+      const now = new Date();
       // 缓存有效（同地点 + 未过期）→ 不用查；旧地点文字也能命中
-      if (weatherCacheMatches(cache, settings) && now - cache.fetchedAt < intervalMs) return;
+      if (weatherCacheMatches(cache, settings) && weatherCacheIsFresh(cache, settings, now)) return;
       // 过期/没有 → 后台查（失败静默，下次再试）。没有宿主网络能力时不出网。
       const fetcher = getConfiguredWeatherFetcher();
       if (typeof fetcher !== "function") return;

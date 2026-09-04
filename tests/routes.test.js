@@ -123,6 +123,58 @@ test("路由：注入预览不提前播报未来待办，旧 MM-DD 也不误判"
   assert.match(result.stdout, /"hasFuture":false/);
 });
 
+test("路由：日期详情和注入预览都不回显过期天气缓存", () => {
+  const isolatedHome = fs.mkdtempSync(path.join(os.tmpdir(), "sgj-route-stale-weather-test-"));
+  const routeUrl = pathToFileURL(path.resolve("routes/ui.js")).href;
+  const dataUrl = pathToFileURL(path.resolve("lib/data.js")).href;
+  const sharedUrl = pathToFileURL(path.resolve("lib/shared-data.js")).href;
+  const childCode = `
+    import path from "node:path";
+    import { UserData } from ${JSON.stringify(dataUrl)};
+    import { __setSharedUserDataForTest } from ${JSON.stringify(sharedUrl)};
+    import registerRoutes from ${JSON.stringify(routeUrl)};
+    const data = new UserData(path.join(process.env.HANA_HOME, "plugin-data", "shiguangji"));
+    __setSharedUserDataForTest(data);
+    const now = new Date();
+    const dateKey = (date) => [date.getFullYear(), String(date.getMonth() + 1).padStart(2, "0"), String(date.getDate()).padStart(2, "0")].join("-");
+    const today = dateKey(now);
+    const location = "河北省 邢台市 襄都区";
+    await data.updateSettings({ weatherLocation: location, weatherArea: { code: "130502" }, weatherEnabled: true, weatherIntervalHours: 3 });
+    await data.addEvent({ title: "过期天气路由锚点", type: "event", date: today });
+    await data.setWeatherCache({
+      location,
+      fetchedAt: Date.now() - 4 * 3600 * 1000,
+      result: { place: location, line: "晴空万里，阳光正好，30°C", temp: 30, code: 0, isDay: true },
+    });
+    const routes = [];
+    const app = {
+      get(path, handler) { routes.push({ method: "GET", path, handler }); },
+      post(path, handler) { routes.push({ method: "POST", path, handler }); },
+      put(path, handler) { routes.push({ method: "PUT", path, handler }); },
+      delete(path, handler) { routes.push({ method: "DELETE", path, handler }); },
+    };
+    registerRoutes(app, { log: { info() {}, warn() {}, error() {} } });
+    const events = routes.find((item) => item.method === "GET" && item.path === "/api/events/:date");
+    const preview = routes.find((item) => item.method === "GET" && item.path === "/api/injection-preview");
+    if (!events || !preview) throw new Error("天气消费路由未注册");
+    const day = await events.handler({ req: { param() { return today; } }, json(value) { return value; } });
+    const previewResult = await preview.handler({ json(value) { return value; } });
+    if (day.day.weather !== null) throw new Error("日期详情仍回显过期天气：" + JSON.stringify(day.day.weather));
+    if (previewResult.text.includes("窗外") || previewResult.text.includes("阳光正好")) {
+      throw new Error("注入预览仍回显过期天气：" + previewResult.text);
+    }
+    console.log(JSON.stringify({ ok: true, dayWeather: day.day.weather, previewHasWeather: previewResult.text.includes("窗外") }));
+  `;
+  const result = spawnSync(process.execPath, ["--input-type=module", "-e", childCode], {
+    encoding: "utf8",
+    env: { ...process.env, USERPROFILE: isolatedHome, HOME: isolatedHome, HANA_HOME: path.join(isolatedHome, ".hanako") },
+  });
+  assert.equal(result.status, 0, result.stderr || result.stdout);
+  assert.match(result.stdout, /"ok":true/);
+  assert.match(result.stdout, /"dayWeather":null/);
+  assert.match(result.stdout, /"previewHasWeather":false/);
+});
+
 test("路由：30 分钟注入间隔可保存并跨实例回读", () => {
   const isolatedHome = fs.mkdtempSync(path.join(os.tmpdir(), "sgj-settings-route-test-"));
   const routeUrl = pathToFileURL(path.resolve("routes/ui.js")).href;
