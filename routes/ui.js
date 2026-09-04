@@ -8,7 +8,7 @@ import { renderPage } from "../lib/page-template.js";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { UserData, dateKey, filterDueTodos, isTodoOverdue } from "../lib/data.js";
-import { getSharedUserData } from "../lib/shared-data.js";
+import { configureSharedUserData, getSharedUserData } from "../lib/shared-data.js";
 import { getBuiltinFestivals, isWorkday, getMonthFestivals } from "../lib/festivals.js";
 import { ModelConfig } from "../lib/model-config/index.js";
 import { buildInjectionText } from "../lib/inject.js";
@@ -45,7 +45,7 @@ import {
 import { selectRecentSummaries } from "../lib/recent-summaries.js";
 import { readHanaUserName } from "../lib/user-name.js";
 import { TodoReminderScheduler } from "../lib/todo-reminder-scheduler.js";
-import { logInfo, logWarn, logError } from "../lib/debug-log.js";
+import { configureDebugLog, logInfo, logWarn, logError } from "../lib/debug-log.js";
 import { UpdateChecker } from "../lib/update-checker/index.js";
 import { Feedback } from "../lib/feedback/index.js";
 
@@ -225,6 +225,8 @@ function normalizeSummaryOutput(value, userName) {
 }
 
 export default function registerRoutes(app, ctx) {
+  configureSharedUserData(ctx?.dataDir);
+  configureDebugLog(ctx?.dataDir);
   // 页面路由拿得到插件 ctx；把宿主网络能力交给扩展的后台天气刷新复用。
   const weatherFetcher = configureWeatherNetwork(ctx?.network);
   const mc = new ModelConfig({ ctx, store: makeSettingsStore() });

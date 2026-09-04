@@ -6,7 +6,7 @@ import crypto from "node:crypto";
 import os from "node:os";
 import path from "node:path";
 import { filterDueTodos } from "../lib/data.js";
-import { getSharedUserData } from "../lib/shared-data.js";
+import { configureSharedUserData, getSharedUserData } from "../lib/shared-data.js";
 import { InjectionTracker, shouldInject, buildInjectionText } from "../lib/inject.js";
 import { selectRecentSummaries } from "../lib/recent-summaries.js";
 import { getBuiltinFestivals, isWorkday } from "../lib/festivals.js";
@@ -21,7 +21,7 @@ import {
   weatherCacheIsFresh,
   weatherCacheMatches,
 } from "../lib/weather.js";
-import { logInfo } from "../lib/debug-log.js";
+import { configureDebugLog, logInfo } from "../lib/debug-log.js";
 
 const tracker = new InjectionTracker();
 let weatherTimer = null; // 天气惰性刷新定时器
@@ -30,11 +30,25 @@ export function __resetLazySummaryForTest() {
   // 兼容旧测试入口；总结已统一由路由层可靠定时器负责。
 }
 
-function getData() {
+function contextDataDir(context) {
+  return context?.dataDir || context?.pluginContext?.dataDir || context?.ctx?.dataDir || null;
+}
+
+function getData(context = null) {
+  const dataDir = contextDataDir(context);
+  if (dataDir) {
+    configureSharedUserData(dataDir);
+    configureDebugLog(dataDir);
+  }
   return getSharedUserData();
 }
 
 export default function registerShiguangjiInject(pi) {
+  const dataDir = contextDataDir(pi);
+  if (dataDir) {
+    configureSharedUserData(dataDir);
+    configureDebugLog(dataDir);
+  }
   // 天气惰性刷新：每 15 分钟检查一次缓存是否过期，过期就后台查（不阻塞注入）
   startWeatherRefresher();
 
@@ -43,7 +57,7 @@ export default function registerShiguangjiInject(pi) {
       const sessionId = ctx?.sessionManager?.getSessionId?.() || null;
       if (!sessionId) return undefined;
 
-      const data = getData();
+      const data = getData(ctx);
       const settings = data.getSettings();
       const now = new Date();
       const injectionEnabled = settings.injectionEnabled !== false;

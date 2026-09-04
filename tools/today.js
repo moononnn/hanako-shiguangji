@@ -5,8 +5,8 @@ import { getSharedUserData } from "../lib/shared-data.js";
 import { getBuiltinFestivals, isWorkday } from "../lib/festivals.js";
 import { dateKey, filterDueTodos, isTodoOverdue } from "../lib/data.js";
 
-function getData() {
-  return getSharedUserData();
+function getData(context = null) {
+  return getSharedUserData(context?.dataDir || context?.pluginContext?.dataDir || context?.ctx?.dataDir);
 }
 
 export const name = "shiguangji_today";
@@ -18,10 +18,10 @@ export const parameters = {
   properties: {},
 };
 
-export async function execute() {
+export async function execute(_input = {}, context = {}) {
   const now = new Date();
   const builtin = getBuiltinFestivals(now);
-  const data = getData();
+  const data = getData(context);
   const settings = data.getSettings();
   const userEvents = data.eventsOnDate(now).filter((e) => e.type !== "period");
   const periods = settings.showPeriod === false

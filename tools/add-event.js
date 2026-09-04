@@ -4,8 +4,8 @@
 import { getSharedUserData } from "../lib/shared-data.js";
 import { formatTodoReminderWindow, parseTodoReminderText } from "../lib/todo-time.js";
 
-function getData() {
-  return getSharedUserData();
+function getData(context = null) {
+  return getSharedUserData(context?.dataDir || context?.pluginContext?.dataDir || context?.ctx?.dataDir);
 }
 
 export const name = "shiguangji_add_event";
@@ -31,7 +31,7 @@ export const parameters = {
 
 export async function execute(input = {}, options = {}) {
   try {
-    const data = getData();
+    const data = getData(options);
     const inferenceNow = options?.now instanceof Date ? options.now : new Date();
     let ev;
     if (input.type === "period") {
