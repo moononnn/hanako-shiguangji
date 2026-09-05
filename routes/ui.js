@@ -1144,6 +1144,8 @@ async function runDailySummaryUnlocked(ctx, { targetDate, manual = false, previe
         maxTokens: 500,
         temperature: 0.4,
         timeoutMs: 60000,
+        callPurpose: "summary",
+        reasoningLevel: "off",
         // 跟随助手档时显式绑定真实伙伴 Agent，避免总结模型误用当前页面助手。
         agentId: modelAgentId,
       });
