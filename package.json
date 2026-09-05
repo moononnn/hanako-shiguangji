@@ -1,6 +1,6 @@
 {
   "name": "hanako-shiguangji",
-  "version": "0.2.60",
+  "version": "0.2.62",
   "description": "日子账本：情境注入引擎 + 日历 + 节假日/纪念日/待办 + 每日做册。让每个助手都知道今天是什么日子。",
   "private": true,
   "type": "module",

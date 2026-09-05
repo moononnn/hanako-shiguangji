@@ -419,6 +419,7 @@ test("路由：整理一天时按伙伴调用模型并分别归档", () => {
     const result = await run.handler({ req: { async json() { return { date: "2026-08-29" }; } }, json(value) { return value; } });
     if (!result.ok || !Array.isArray(result.summaries) || result.summaries.length !== 2) throw new Error("分类总结结果数量不对：" + JSON.stringify(result));
     if (calls.length !== 2 || calls.some((call) => call.topic !== "utility:call-text" || !call.input.agentId)) throw new Error("没有按伙伴分别调用模型");
+    if (calls.some((call) => call.input.callPurpose !== "summary" || call.input.reasoningLevel !== "off")) throw new Error("总结调用没有显式使用短任务策略");
     if (calls.some((call) => !String(call.input.messages?.[0]?.content || "").includes("小测试"))) throw new Error("总结提示没有使用动态称呼");
     if (calls.some((call) => String(call.input.messages?.[0]?.content || "").includes("与用户"))) throw new Error("总结提示仍写死了用户称呼");
     const saved = await list.handler({ json(value) { return value; } });
@@ -1063,6 +1064,13 @@ test("时光册：入口与日历多选控件统一使用做册文案", async ()
   assert.match(script, /retrySummaryJobFailed/);
   assert.match(script, /retry-failed/);
   assert.match(script, /summary-job-failed-item/);
+  assert.match(script, /runSummaryFromDay\([^)]*, this\)/);
+  assert.match(script, /id="detail-summary-msg"/);
+  assert.match(script, /'<\/div><\/div><span class="sum-msg" id="detail-summary-msg"><\/span><\/div>'/);
+  assert.match(script, /markSummaryTriggerPending/);
+  assert.match(script, /正在放到后台/);
+  assert.match(script, /正在把失败的部分放回后台/);
+  assert.match(script, /trigger\.disabled = true/);
   // 确认收下：完成的册子显示「知道了」，确认后从列表过滤
   assert.match(script, /function dismissSummaryJob/);
   assert.match(script, /\/dismiss/);
