@@ -198,15 +198,15 @@ test("路由：30 分钟注入间隔可保存并跨实例回读", () => {
       req: { async json() { return body; } },
       json(value) { return value; },
     });
-    const saved = await callPost({ injectMode: "balanced", injectIntervalHours: 0.5 });
-    if (!saved.ok || saved.settings.injectIntervalHours !== 0.5) {
-      throw new Error("30分钟档没有保存：" + JSON.stringify(saved));
+    const saved = await callPost({ injectMode: "balanced", injectIntervalHours: 0.5, moodDiscoveryMode: "detailed" });
+    if (!saved.ok || saved.settings.injectIntervalHours !== 0.5 || saved.settings.moodDiscoveryMode !== "detailed") {
+      throw new Error("30分钟档或自动情绪档位没有保存：" + JSON.stringify(saved));
     }
     const routeRead = await get.handler({ json(value) { return value; } });
     const freshData = new UserData(path.join(process.env.HANA_HOME, "plugin-data", "shiguangji"));
     const reopened = freshData.getSettings();
-    if (routeRead.settings.injectIntervalHours !== 0.5 || reopened.injectIntervalHours !== 0.5) {
-      throw new Error("30分钟档重新打开后没有回读：" + JSON.stringify({ routeRead, reopened }));
+    if (routeRead.settings.injectIntervalHours !== 0.5 || reopened.injectIntervalHours !== 0.5 || routeRead.settings.moodDiscoveryMode !== "detailed" || reopened.moodDiscoveryMode !== "detailed") {
+      throw new Error("30分钟档或自动情绪档位重新打开后没有回读：" + JSON.stringify({ routeRead, reopened }));
     }
     const removedLegacy = await callPost({ injectIntervalHours: 2 });
     if (removedLegacy.ok || !String(removedLegacy.error || "").includes("间隔")) {
@@ -435,6 +435,61 @@ test("路由：整理一天时按伙伴调用模型并分别归档", () => {
   assert.equal(result.status, 0, result.stderr || result.stdout);
   assert.match(result.stdout, /"calls":2/);
   assert.match(result.stdout, /partner-two/);
+});
+
+test("路由：hana 档指定做册模型时，总结调用不带 agentId（防被宿主按助手模型路由）", () => {
+  const isolatedHome = fs.mkdtempSync(path.join(os.tmpdir(), "sgj-summary-hana-model-route-test-"));
+  const routeUrl = pathToFileURL(path.resolve("routes/ui.js")).href;
+  const dataUrl = pathToFileURL(path.resolve("lib/data.js")).href;
+  const childCode = `
+    import fs from "node:fs";
+    import path from "node:path";
+    import os from "node:os";
+    import { UserData } from ${JSON.stringify(dataUrl)};
+    import registerRoutes from ${JSON.stringify(routeUrl)};
+    const home = path.join(os.homedir(), ".hanako");
+    fs.mkdirSync(path.join(home), { recursive: true });
+    fs.writeFileSync(path.join(home, "users.json"), JSON.stringify({ displayName: "小测试" }));
+    // 预置：设置里选 hana 档 + 指定 deepseek（模拟用户把做册模型指到非 MiniMax 渠道）
+    await new UserData(path.join(home, "plugin-data", "shiguangji")).updateSettings({
+      modelSource: "hana",
+      hanaModel: { providerId: "deepseek", modelId: "deepseek-v4-flash" },
+    });
+    const root = path.join(home, "agents");
+    fs.mkdirSync(path.join(root, "hanako", "sessions"), { recursive: true });
+    fs.writeFileSync(path.join(root, "hanako", "config.yaml"), "agent:\\n  name: 小花\\n");
+    fs.writeFileSync(path.join(root, "hanako", "sessions", "one.jsonl"), JSON.stringify({ type: "message", timestamp: "2026-08-29T10:00:00", message: { role: "user", content: "一起整理日历" } }) + "\\n");
+    const routes = [];
+    const app = {
+      get(p, h) { routes.push({ method: "GET", path: p, handler: h }); },
+      post(p, h) { routes.push({ method: "POST", path: p, handler: h }); },
+      put(p, h) { routes.push({ method: "PUT", path: p, handler: h }); },
+      delete(p, h) { routes.push({ method: "DELETE", path: p, handler: h }); },
+    };
+    const calls = [];
+    registerRoutes(app, {
+      bus: { async request(topic, input) { calls.push({ topic, input }); return { text: "摘要：正常生成" }; } },
+      log: { info() {}, warn() {}, error() {} },
+    });
+    const run = routes.find((item) => item.method === "POST" && item.path === "/api/summaries/run");
+    const result = await run.handler({ req: { async json() { return { date: "2026-08-29" }; } }, json(value) { return value; } });
+    if (!result.ok) throw new Error("做册失败：" + JSON.stringify(result));
+    const call = calls.find((c) => c.input?.callPurpose === "summary");
+    if (!call) throw new Error("没有发出总结调用");
+    // 铁律：hana 档显式指定了 provider/model，绝不能带 agentId（否则宿主按助手模型路由，指定模型被忽略）
+    if (call.input.agentId) throw new Error("hana 档仍带了 agentId：" + JSON.stringify(call.input));
+    if (call.input.providerId !== "deepseek" || call.input.modelId !== "deepseek-v4-flash") {
+      throw new Error("hana 档没有使用指定模型：" + JSON.stringify(call.input));
+    }
+    console.log(JSON.stringify({ providerId: call.input.providerId, modelId: call.input.modelId, agentId: call.input.agentId || null }));
+  `;
+  const result = spawnSync(process.execPath, ["--input-type=module", "-e", childCode], {
+    encoding: "utf8",
+    env: { ...process.env, USERPROFILE: isolatedHome, HOME: isolatedHome, HANA_HOME: path.join(isolatedHome, ".hanako") },
+  });
+  assert.equal(result.status, 0, result.stderr || result.stdout);
+  assert.match(result.stdout, /"providerId":"deepseek"/);
+  assert.match(result.stdout, /"agentId":null/);
 });
 
 test("路由：后台总结任务异步完成、持久化并清洗用户称呼", () => {

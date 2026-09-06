@@ -21,6 +21,7 @@ import {
   normalizeDateKey,
   filterDueTodos,
   isTodoOverdue,
+  normalizeMoodDiscoveryMode,
 } from "../lib/data.js";
 import { normalizeReminderTime, normalizeTodoReminderWindow, formatTodoReminderWindow, parseTodoReminderText } from "../lib/todo-time.js";
 import { parseUserNames, readHanaUserName } from "../lib/user-name.js";
@@ -347,6 +348,16 @@ test("注入文本：不带时间时省略时刻", () => {
   const text = buildInjectionText({ now: D1, includeTime: false, builtinFestivals: [{ name: "七夕", emoji: "💞" }] });
   assert.ok(!text.includes("10:00"), text);
   assert.ok(text.includes("2026年8月28日"));
+});
+
+test("总结提示：需要时按真实消息时间排序并保留生活日日期", () => {
+  const text = formatMessagesForPrompt([
+    { role: "user", ts: new Date("2026-09-06T00:30:00+08:00").getTime(), text: "深夜还在想事情" },
+    { role: "assistant", ts: new Date("2026-09-05T16:14:00+08:00").getTime(), agentId: "hanako", text: "我先陪你捋一捋" },
+    { role: "user", ts: new Date("2026-09-05T16:14:00+08:00").getTime(), text: "我有点焦虑" },
+  ], { agentName: "小花", includeTime: true });
+  assert.ok(text.indexOf("[2026-09-05 16:14] 小花") < text.indexOf("[2026-09-06 00:30] 我"), text);
+  assert.match(text, /\[2026-09-05 16:14\] 我：我有点焦虑/);
 });
 
 test("生活日总结：按伙伴分组且近期默认不跨伙伴", async () => {
@@ -928,7 +939,7 @@ test("数据层：加密文件里没有明文事件", async () => {
 });
 
 // ── 生理期开关（设置层） ──
-test("设置：默认生理期开启且近期总结默认不共享", () => {
+test("设置：默认生理期开启、近期总结不共享、自动情绪走轻量档", () => {
   const ud = new UserData(tmpDir("set1"));
   const s = ud.getSettings();
   assert.equal(s.showPeriod, true, "默认应开启生理期记录");
@@ -936,6 +947,9 @@ test("设置：默认生理期开启且近期总结默认不共享", () => {
   assert.equal(s.summaryAgentIds, null, "默认应总结所有伙伴");
   assert.equal(s.injectionEnabled, true, "默认应开启情境注入");
   assert.equal(s.weatherEnabled, true, "默认应保留天气能力");
+  assert.equal(s.moodDiscoveryMode, "economical", "自动情绪默认先走轻量档");
+  assert.equal(normalizeMoodDiscoveryMode("detailed"), "detailed");
+  assert.equal(normalizeMoodDiscoveryMode("invalid"), "economical");
 });
 
 test("设置：情境和天气开关跨实例保存且不覆盖原有节奏", async () => {
@@ -995,6 +1009,19 @@ test("设置：近期总结共享开关能跨实例持久化", async () => {
   assert.equal(ud2.getSettings().summaryShared, true);
   await ud2.updateSettings({ summaryShared: false });
   assert.equal(new UserData(d).getSettings().summaryShared, false);
+});
+
+test("自动情绪发现状态：跨实例保存且不把日期明文写出", async () => {
+  const d = tmpDir("mood-harvest-state");
+  const ud = new UserData(d);
+  await ud.updateSettings({ moodDiscoveryMode: "detailed" });
+  await ud.updateMoodHarvestState("2026-09-05", { status: "completed", attemptedAt: "2026-09-06T00:00:00.000Z", candidateCount: 2 });
+  const restored = new UserData(d);
+  assert.equal(restored.getSettings().moodDiscoveryMode, "detailed");
+  assert.equal(restored.getMoodHarvestState("2026-09-05").status, "completed");
+  assert.equal(restored.getMoodHarvestState("2026-09-05").candidateCount, 2);
+  const raw = fs.readFileSync(path.join(d, "mood-harvests.dat"), "utf8");
+  assert.ok(!raw.includes("2026-09-05"), "自动情绪状态文件也应保持加密");
 });
 
 test("设置：updateSettings 能保存生理期开关状态", async () => {
