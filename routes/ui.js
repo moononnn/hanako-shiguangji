@@ -7,7 +7,7 @@ import os from "node:os";
 import { renderPage } from "../lib/page-template.js";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { UserData, dateKey, filterDueTodos, isTodoOverdue } from "../lib/data.js";
+import { UserData, dateKey, filterDueTodos, isTodoOverdue, normalizeMoodDiscoveryMode } from "../lib/data.js";
 import { configureSharedUserData, getSharedUserData } from "../lib/shared-data.js";
 import { getBuiltinFestivals, isWorkday, getMonthFestivals } from "../lib/festivals.js";
 import { ModelConfig } from "../lib/model-config/index.js";
@@ -43,7 +43,22 @@ import {
   sanitizeVisibleText,
 } from "../lib/day-summary.js";
 import { selectRecentSummaries } from "../lib/recent-summaries.js";
+import {
+  MOODS,
+  buildSignalAwareEvidence,
+  findExplicitMoodSignals,
+  makeManualMood,
+  mergeMoodEntries,
+  moodById,
+  normalizeMoodId,
+  parseMoodOutput,
+  parseMoodReviewOutput,
+  pickDayMood,
+  segmentLabel,
+  segmentOfHour,
+} from "../lib/mood.js";
 import { readHanaUserName } from "../lib/user-name.js";
+import { moodLineSegmentForEntry, moodLineSegmentLabelForEntry } from "../lib/mood-line.js";
 import { TodoReminderScheduler } from "../lib/todo-reminder-scheduler.js";
 import { configureDebugLog, logInfo, logWarn, logError } from "../lib/debug-log.js";
 import { UpdateChecker } from "../lib/update-checker/index.js";
@@ -61,6 +76,12 @@ const summaryAttempts = new Map(); // date -> timestamp，失败时节流后可�
 const SUMMARY_REVISION_SESSION_TTL_MS = 30 * 60 * 1000;
 const summaryRevisionSessions = new Map();
 const INJECT_INTERVAL_HOURS = new Set([0.5, 1, 4, 8]);
+const MOOD_HARVEST_TERMINAL_STATUSES = new Set(["skipped", "completed"]);
+// failed 不算终态：模型被劫持/审核拒/瞬时失败后，定时器要能再试。
+
+function isMoodHarvestTerminal(state) {
+  return !!state && MOOD_HARVEST_TERMINAL_STATUSES.has(String(state.status || ""));
+}
 
 function cleanupSummaryRevisionSessions(now = Date.now()) {
   for (const [id, session] of summaryRevisionSessions.entries()) {
@@ -318,6 +339,9 @@ export default function registerRoutes(app, ctx) {
         overdueTodos,
         weather,
         workday,
+        // 这一天的心情记录（时间线回看；今日卡随手记也走这里刷新）
+        moods: moodEntriesForDate(dk),
+        moodMeta: MOODS,
       },
     });
   });
@@ -567,6 +591,9 @@ export default function registerRoutes(app, ctx) {
         predictedPeriods: periods.filter((p) => p.predicted).length,
         hasSummary: data.hasSummary(dk),
         canBatchSummary: dk <= finishedLimit,
+        // 日历角标：只要当天有情绪记录，格子角落就能挂一枚小表情（回看心情年历）
+        hasMood: data.hasMood(dk),
+        moodEmoji: pickDayMood(data.getDayMoods(dk))?.emoji || "",
       });
     }
     const monthHasUserEvents = userEvents.some((e) =>
@@ -577,8 +604,8 @@ export default function registerRoutes(app, ctx) {
       year: y,
       month: m,
       days,
-      // 当月完全没有任何记录（用户事件/生理期/总结）时才显示新手引导。
-      hasAnyRecord: monthHasUserEvents || days.some((d) => d.periods + d.predictedPeriods > 0 || d.hasSummary),
+      // 当月完全没有任何记录（用户事件/生理期/总结/情绪）时才显示新手引导。
+      hasAnyRecord: monthHasUserEvents || days.some((d) => d.periods + d.predictedPeriods > 0 || d.hasSummary || d.hasMood),
     });
   });
 
@@ -592,6 +619,7 @@ export default function registerRoutes(app, ctx) {
         injectMode: s.injectMode,
         injectIntervalHours: s.injectIntervalHours,
         autoSummary: s.autoSummary,
+        moodDiscoveryMode: normalizeMoodDiscoveryMode(s.moodDiscoveryMode),
         dayBoundaryHour: normalizeBoundaryHour(s.dayBoundaryHour),
         summaryAgentIds: normalizeSummaryAgentIds(s.summaryAgentIds),
         summaryAgents: listSummaryAgents(AGENTS_DIR),
@@ -622,6 +650,11 @@ export default function registerRoutes(app, ctx) {
         patch.injectIntervalHours = v;
       }
       if (body.autoSummary !== undefined) patch.autoSummary = !!body.autoSummary;
+      if (body.moodDiscoveryMode !== undefined) {
+        const mode = String(body.moodDiscoveryMode || "").trim().toLowerCase();
+        if (!["off", "economical", "detailed"].includes(mode)) return c.json({ ok: false, error: "自动情绪档位不对" });
+        patch.moodDiscoveryMode = mode;
+      }
       if (body.summaryAgentIds !== undefined) {
         if (body.summaryAgentIds !== null && !Array.isArray(body.summaryAgentIds)) {
           return c.json({ ok: false, error: "做册伙伴选择格式不对" });
@@ -1058,6 +1091,9 @@ export default function registerRoutes(app, ctx) {
     });
   });
 
+  // 情绪记录 API（记一笔当下的心情：手动标记 + 合稿产出读取/编辑/删除）
+  registerMoodRoutes(app);
+
   // 路由和模型配置都准备好后，再恢复上次未结束的后台总结任务。
   resumeSummaryJobs(ctx);
 }
@@ -1082,10 +1118,18 @@ export async function runDailySummary(ctx, options = {}) {
   return tracked;
 }
 
-async function runDailySummaryUnlocked(ctx, { targetDate, manual = false, preview = false, selectedAgentIdsOverride } = {}) {
+async function runDailySummaryUnlocked(ctx, {
+  targetDate,
+  manual = false,
+  preview = false,
+  moodOnly = false,
+  forceMood = false,
+  selectedAgentIdsOverride,
+} = {}) {
   const data = getData();
   const settings = data.getSettings();
-  if (!manual && !settings.autoSummary) return { ok: false, error: "自动做册未开启" };
+  const moodMode = normalizeMoodDiscoveryMode(settings.moodDiscoveryMode);
+  if (!manual && !settings.autoSummary && !(moodOnly && moodMode !== "off")) return { ok: false, error: "自动做册未开启" };
 
   const boundary = normalizeBoundaryHour(settings.dayBoundaryHour);
   const latestFinished = finishedLifeDayKey(new Date(), boundary);
@@ -1108,6 +1152,32 @@ async function runDailySummaryUnlocked(ctx, { targetDate, manual = false, previe
     groupSummaryMessages(messages, { agentsDir: AGENTS_DIR }),
     groupHistoricalSummaryEntries(data.listSummaryEntries(day), { agentsDir: AGENTS_DIR }),
   );
+  const userName = readHanaUserName() || "对方";
+  let moodResult = null;
+  if (!preview && moodMode !== "off") {
+    try {
+      moodResult = await harvestMoodForDay(ctx, {
+        day,
+        range,
+        userName,
+        force: forceMood,
+        messages,
+        // 证据窗口在 harvestMoodForDay 内部按情绪信号感知重算，这里不必再拼整段对话。
+      });
+      if (moodResult?.ok && !moodResult.skipped) {
+        logInfo(`${day} 情绪发现完成：候选 ${moodResult.candidateCount || 0} 条，保留 ${moodResult.autoCount || 0} 条`);
+      }
+    } catch (e) {
+      // 情绪发现是附加能力，失败不能让日子档案跟着失败。
+      logWarn(`${day} 情绪发现失败（不影响做册）：${e?.message || e}`);
+      moodResult = { ok: false, error: e?.message || "模型调用失败" };
+    }
+  }
+
+  if (moodOnly) {
+    return { ok: true, date: day, preview, moodOnly: true, mood: moodResult, text: "" };
+  }
+
   const allAgentIds = groups.map((group) => group.agentId);
   const selectedAgentIds = selectedAgentIdsOverride !== undefined
     ? (selectedAgentIdsOverride === null
@@ -1121,17 +1191,16 @@ async function runDailySummaryUnlocked(ctx, { targetDate, manual = false, previe
     : groups;
   if (!selectedGroups.length) {
     if (allAgentIds.length && selectedAgentIds) {
-      return { ok: true, empty: true, skipped: true, date: day, text: "这一天没有选中的伙伴可整理" };
+      return { ok: true, empty: true, skipped: true, date: day, text: "这一天没有选中的伙伴可整理", mood: moodResult };
     }
     if (!manual) {
       await data.saveSummary(day, "", { empty: true, source: "auto", boundaryHour: boundary });
     }
-    return { ok: true, empty: true, date: day, text: "这一天没有可整理的对话" };
+    return { ok: true, empty: true, date: day, text: "这一天没有可整理的对话", mood: moodResult };
   }
 
   if (!mcInstance) return { ok: false, error: "插件路由未初始化" };
   const generated = [];
-  const userName = readHanaUserName() || "对方";
   for (const group of selectedGroups) {
     const { agentId, agentName, modelAgentId, messages: groupMessages } = group;
     const prompt =
@@ -1140,15 +1209,18 @@ async function runDailySummaryUnlocked(ctx, { targetDate, manual = false, previe
       formatMessagesForPrompt(groupMessages, { agentName });
     let text;
     try {
-      text = await mcInstance.sample([{ role: "user", content: prompt }], {
+      // agentId 只在「跟随助手」档才传：hana/custom 档显式指定了 provider/model，
+      // 再带 agentId 会被宿主按助手的模型优先路由，指定模型被忽略（做册误走助手 MiniMax 的教训）。
+      const summarySource = (data.getSettings().modelSource || "agent");
+      const sampleOpts = {
         maxTokens: 500,
         temperature: 0.4,
         timeoutMs: 60000,
         callPurpose: "summary",
         reasoningLevel: "off",
-        // 跟随助手档时显式绑定真实伙伴 Agent，避免总结模型误用当前页面助手。
-        agentId: modelAgentId,
-      });
+      };
+      if (summarySource === "agent") sampleOpts.agentId = modelAgentId;
+      text = await mcInstance.sample([{ role: "user", content: prompt }], sampleOpts);
     } catch (e) {
       const errMsg = e?.message || "模型调用失败";
       logError(`${day} ${agentName} 做册模型调用失败：${errMsg}`);
@@ -1180,7 +1252,7 @@ async function runDailySummaryUnlocked(ctx, { targetDate, manual = false, previe
   const text = generated.length === 1
     ? generated[0].text
     : generated.map((item) => `【${item.agentName}】\n${item.text}`).join("\n\n");
-  return { ok: true, text, date: day, preview, summaries: generated };
+  return { ok: true, text, date: day, preview, summaries: generated, mood: moodResult };
 }
 
 function makeSummaryJobOutcome(date, result) {
@@ -1217,7 +1289,9 @@ async function processSummaryJob(ctx, jobId) {
       let result;
       try {
         // 批量任务按日期串行处理，避免同时打模型造成限流或互相覆盖档案。
-        const runOptions = { targetDate: date, manual: true, preview: false };
+        // 批量任务=用户主动翻历史（前端固定 force:true），情绪链强制重扫，历史空档一次补回；
+        // 自动定时器不投递 job，单日 run 不设 force，两者继续尊重“已处理”。
+        const runOptions = { targetDate: date, manual: true, preview: false, forceMood: job.force === true };
         if (Object.prototype.hasOwnProperty.call(job, "summaryAgentIds")) {
           runOptions.selectedAgentIdsOverride = job.summaryAgentIds;
         }
@@ -1300,22 +1374,38 @@ function startSummaryTimer(ctx) {
   if (summaryTimer) return;
   const check = () => {
     try {
-      const settings = getData().getSettings();
-      if (!settings.autoSummary) return;
-      // 明确全不选时不反复触发空整理；等用户重新选择伙伴后再由下一轮自然接手。
+      const data = getData();
+      const settings = data.getSettings();
+      const moodEnabled = normalizeMoodDiscoveryMode(settings.moodDiscoveryMode) !== "off";
+      if (!settings.autoSummary && !moodEnabled) return;
+      // 明确全不选时不反复触发空整理；但自动情绪仍是独立能力，不能被做册伙伴选择挡掉。
       const selectedAgentIds = getSelectedSummaryAgentIds(settings);
-      if (selectedAgentIds && selectedAgentIds.size === 0) return;
+      const summarySelectionEmpty = !!(selectedAgentIds && selectedAgentIds.size === 0);
       const day = finishedLifeDayKey(new Date(), settings.dayBoundaryHour);
-      if (findActiveSummaryJob(getData())) return;
+      if (findActiveSummaryJob(data)) return;
       // 旧版混合档案不算分类总结；花酿旧随机 visitor 档案也要自动重整成逻辑角色档案。
-      if (getData().hasAgentSummary(day) && !hasStaleHanabrewSummary(day)) return;
+      const summaryReady = data.hasAgentSummary(day) && !hasStaleHanabrewSummary(day);
+      const moodState = moodEnabled ? data.getMoodHarvestState(day) : null;
+      const moodHandled = isMoodHarvestTerminal(moodState);
+      const needsSummary = settings.autoSummary && !summaryReady && !summarySelectionEmpty;
+      const needsMood = moodEnabled && !moodHandled;
+      if (!needsSummary && !needsMood) return;
       const lastAttempt = summaryAttempts.get(day) || 0;
       if (Date.now() - lastAttempt < 10 * 60 * 1000) return;
       summaryAttempts.set(day, Date.now());
-      logInfo(`自动总结定时器触发，目标 ${day}（边界 ${settings.dayBoundaryHour} 点）`);
-      runDailySummary(ctx, { targetDate: day, manual: false }).then((r) => {
+      logInfo(`${settings.autoSummary ? "自动总结" : "自动情绪发现"}定时器触发，目标 ${day}（边界 ${settings.dayBoundaryHour} 点）`);
+      runDailySummary(ctx, {
+        targetDate: day,
+        manual: false,
+        // 已有总结、做册伙伴全不选或自动做册关闭时，只跑独立情绪链。
+        moodOnly: !settings.autoSummary || summaryReady || summarySelectionEmpty,
+      }).then((r) => {
         if (r.ok && !r.skipped) summaryAttempts.delete(day);
-        const msg = r.ok ? (r.empty ? "无对话" : (r.skipped ? "跳过（无选中伙伴）" : `已生成 ${(r.summaries || []).length} 页`)) : (r.error || "未知失败");
+        const msg = r.ok
+          ? (r.moodOnly
+            ? (r.mood?.ok === false ? `情绪发现失败：${r.mood.error || "模型调用失败"}` : (r.mood?.skipped ? "情绪发现跳过" : `已发现 ${r.mood?.autoCount || 0} 条情绪候选`))
+            : (r.empty ? "无对话" : (r.skipped ? "跳过（无选中伙伴）" : `已生成 ${(r.summaries || []).length} 页`)))
+          : (r.error || "未知失败");
         ctx?.log?.info?.(`[拾光记] ${day} 日子档案: ${msg}`);
         logInfo(`${day} 日子档案: ${msg}`);
       }).catch((e) => {
@@ -1331,6 +1421,330 @@ function startSummaryTimer(ctx) {
   check();
   summaryTimer = setInterval(check, 60 * 1000);
   summaryTimer.unref?.();
+}
+
+// ── 情绪（记一笔当下的心情）路由与合稿 ──
+
+function decorateMoodEntry(entry) {
+  if (!entry) return null;
+  const meta = moodById(entry.mood || entry.label || "");
+  return {
+    ...entry,
+    label: entry.label || meta?.label || "",
+    emoji: entry.emoji || meta?.emoji || "",
+    segmentLabel: segmentLabel(entry.segment),
+    lineSegment: moodLineSegmentForEntry(entry),
+    lineSegmentLabel: moodLineSegmentLabelForEntry(entry),
+  };
+}
+
+function moodEntriesForDate(date) {
+  return getData().getDayMoods(date).map(decorateMoodEntry);
+}
+
+/**
+ * 日终自动情绪发现：本地预筛 → 一次带时间批量分析 →（细致档位按需）一次小型裁决。
+ * 这条链路只读拾光记自己的可见消息与设置，不调用表情包插件，也不写任何伙伴身份文件。
+ */
+async function harvestMoodForDay(ctx, { day, range, userName, messages = [], conversationText = "", force = false } = {}) {
+  const data = getData();
+  const settings = data.getSettings();
+  const mode = normalizeMoodDiscoveryMode(settings.moodDiscoveryMode);
+  if (mode === "off") return { ok: true, skipped: true, reason: "disabled" };
+
+  const previous = data.getMoodHarvestState(day);
+  if (!force && isMoodHarvestTerminal(previous)) {
+    return { ok: true, skipped: true, reason: "already-handled", state: previous };
+  }
+
+  // 老账补档（force=true）必须看全量消息：做册的 per-agent 160 均匀抽样会把情绪句稀释/抽掉
+  // （实测 08-14 全量 41 条信号被抽到只剩 6 条、08-06 直接 6→0），模型看不到情绪只能回 0 候选；
+  // 所以补老账时独立重收一次不抽样的消息。当天自动翻篇维持调用方传入的抽样消息，口径不变。
+  const moodMessages = force
+    ? collectDayMessages({
+        agentsDir: AGENTS_DIR,
+        targetDate: day,
+        boundaryHour: data.getSettings().dayBoundaryHour ?? 0,
+        // 情绪证据靠本地预筛锚定 + 预算窗口，不受消息条数限制；不抽样，宁可多不可漏。
+        maxMessages: 20000,
+        maxMessagesPerAgent: 0,
+      })
+    : null;
+  const rows = moodMessages && moodMessages.messages && moodMessages.messages.length
+    ? moodMessages.messages
+    : (Array.isArray(messages) ? messages : []);
+  const fullRange = moodMessages && moodMessages.range && moodMessages.range.start ? moodMessages.range : range;
+  const manual = data.listManualMoods(day);
+  const explicitSignals = findExplicitMoodSignals(rows);
+  const saveState = async (patch) => {
+    try {
+      return await data.updateMoodHarvestState(day, patch);
+    } catch (e) {
+      logWarn(`${day} 自动情绪状态保存失败：${e?.message || e}`);
+      return null;
+    }
+  };
+
+  // 没有可见消息就没有证据，不为了一张空白情绪线调用模型。
+  if (!rows.length) {
+    await saveState({ status: "skipped", mode, reason: "no-visible-message", checkedAt: new Date().toISOString() });
+    return { ok: true, skipped: true, reason: "no-visible-message" };
+  }
+  // 轻量档只把本地命中情绪词的生活日交给模型；手动亲笔也会触发一次旁白整理。
+  if (mode === "economical" && !manual.length && !explicitSignals.length) {
+    await saveState({ status: "skipped", mode, reason: "no-explicit-signal", checkedAt: new Date().toISOString(), messageCount: rows.length });
+    return { ok: true, skipped: true, reason: "no-explicit-signal" };
+  }
+  if (!mcInstance) {
+    await saveState({ status: "failed", mode, error: "插件路由未初始化", attemptedAt: new Date().toISOString() });
+    return { ok: false, error: "插件路由未初始化" };
+  }
+
+  const attemptedAt = new Date().toISOString();
+  await saveState({ status: "running", mode, attemptedAt, messageCount: rows.length, explicitSignalCount: explicitSignals.length });
+  const whitelist = MOODS.map((m) => m.label).join("/");
+  const entriesText = manual.map((e) => {
+    const seg = segmentLabel(e.segment);
+    const reason = String(e.reason || "").trim();
+    return `${seg} ${e.emoji || ""} ${e.label || e.mood || ""}` + (reason ? `（${reason}）` : "");
+  }).join("\n");
+  // 证据窗口必须是“信号感知”的：以本地预筛命中的消息为锚优先纳入，
+  // 否则一天几万字从头截 8000，下午/晚上的情绪原话会被系统性裁掉，模型只能返回 0 候选。
+  const fmtRow = (row) => {
+    const ts = new Date(Number(row.ts));
+    const stamp = !Number.isNaN(ts.getTime())
+      ? `${dateKey(ts)} ${String(ts.getHours()).padStart(2, "0")}:${String(ts.getMinutes()).padStart(2, "0")}`
+      : "时间不明";
+    return `[${stamp}] ${row.role === "user" ? "我" : "伙伴"}：${row.text}`;
+  };
+  const evidenceText = buildSignalAwareEvidence(rows, explicitSignals, fmtRow, 8000);
+  // 证据校验只对“我”的原话做 substring 匹配，伙伴回复即使被模型抄进 evidence 也不能落成自动候选的证据；
+  // 用户侧同样走信号感知窗口，保证模型抄回的信号原话在校验文本里找得到。
+  const userRows = rows.filter((row) => row?.role === "user");
+  const userEvidenceText = buildSignalAwareEvidence(userRows, explicitSignals, fmtRow, 8000);
+  const signalText = explicitSignals.length
+    ? explicitSignals.map((item) => `- ${item.text}`).join("\n")
+    : "（本地没有命中明确情绪词，细致档位仍可根据上下文谨慎判断）";
+  const prompt =
+    `你是拾光记里帮${userName}整理当天情绪的小花。现在生活日 ${day}（从 ${fullRange.start.toLocaleString("zh-CN")} 到 ${fullRange.end.toLocaleString("zh-CN")}）已翻篇，请根据下面的可见对话，为${userName}生成“自动发现候选”，不要把候选说成确定的心理事实。\n\n` +
+    `${userName}当天亲手记下的心情（她的亲笔，只作锚点，不能改动）：\n${entriesText || "（没有手动标记）"}\n\n` +
+    `本地零 Token 预筛命中的用户文字（只是线索，不代表最终判断）：\n${signalText}\n\n` +
+    `当天可见对话。方括号内是消息真实时间；“我”是${userName}，“伙伴”只是上下文：\n${evidenceText || "（没有可用对话文字）"}\n\n` +
+    `请只输出一个 JSON 数组，不要任何其他文字。每条候选使用以下字段：\n` +
+    `[{ "mood": "情绪词", "segment": "上午|下午|晚上", "observedAt": "从用户消息方括号原样抄回的 YYYY-MM-DD HH:MM；无法确认就填空", "certainty": "clear|possible|uncertain", "evidenceType": "explicit|context", "evidence": "从‘我’原话原样摘出的短句；无法原样找到就填空", "why": "一句带不确定语气的推测；猜不出就填空" }]\n\n` +
+    `规则：\n` +
+    `- mood 只能从这些词里选：${whitelist}；选不出来就不输出那条。\n` +
+    `- 只判断“我”这一方的情绪。伙伴说“我很开心”、系统提示、隐藏思考块都不能算${userName}的情绪。\n` +
+    `- segment 只填“上午/下午/晚上”；没有足够线索时可以填空，系统会把它记成宽泛的白天候选。\n` +
+    `- observedAt 只有在能和某条“我”的真实消息时间逐字对应时才填写，不能根据语义猜一个时间；无法对应就留空。\n` +
+    `- certainty 只能用 clear、possible、uncertain，不要输出 0-100 的心理分数。context 推测优先用 possible 或 uncertain。\n` +
+    `- evidence 必须是对话里“我”原话的连续短摘录，找不到原文就留空；why 可以为空，绝不硬安现实原因。\n` +
+    `- 她手动记过的时段不要重复输出；若同一情绪确实有旁白依据，可以输出同段同情绪来补不确定 why。没有可辨认情绪就输出 []。`;
+
+  let raw;
+  try {
+    raw = await mcInstance.sample([{ role: "user", content: prompt }], {
+      maxTokens: 700,
+      temperature: 0.3,
+      timeoutMs: 45000,
+      callPurpose: "mood-discovery",
+      reasoningLevel: "off",
+      // 自动发现每天最多一次模型批量调用；空正文不再由积木自动重试。
+      retryOnEmpty: false,
+    });
+  } catch (e) {
+    const error = e?.message || "模型调用失败";
+    await saveState({ status: "failed", mode, attemptedAt, finishedAt: new Date().toISOString(), error: String(error).slice(0, 300) });
+    logWarn(`${day} 自动情绪发现模型调用失败：${error}`);
+    return { ok: false, error };
+  }
+
+  const allowedObservedAt = rows
+    .filter((row) => row?.role === "user" && Number.isFinite(Number(row.ts)))
+    .map((row) => row.ts);
+  const candidates = parseMoodOutput(raw, {
+    day,
+    now: new Date(),
+    allowedObservedAt,
+    evidenceSourceText: userEvidenceText,
+  });
+  let finalCandidates = candidates;
+  let reviewedCandidateCount = 0;
+  let reviewedCount = 0;
+
+  if (mode === "detailed" && candidates.length) {
+    const sameMinute = (a, b) => {
+      const at = a ? Date.parse(a) : NaN;
+      const bt = b ? Date.parse(b) : NaN;
+      return Number.isFinite(at) && Number.isFinite(bt) && Math.floor(at / 60000) === Math.floor(bt / 60000);
+    };
+    const conflictsWithManual = (candidate) => manual.some((entry) => {
+      if (entry.mood === candidate.mood) return false;
+      if (candidate.timePrecision === "turn" && candidate.observedAt && entry.recordedAt) return sameMinute(candidate.observedAt, entry.recordedAt);
+      return entry.segment === candidate.segment;
+    });
+    const conflictsWithCandidate = (candidate, index) => candidates.some((other, otherIndex) => {
+      if (index === otherIndex || other.mood === candidate.mood) return false;
+      if (candidate.timePrecision === "turn" && other.timePrecision === "turn") return sameMinute(candidate.observedAt, other.observedAt);
+      return candidate.segment === other.segment && candidate.timePrecision !== "turn" && other.timePrecision !== "turn";
+    });
+    // force=true（用户主动翻历史补档）走宽松复核：同段不同情绪允许共存，
+    // 不再因为候选互相冲突就送复核砍掉，让老账心情线丰富起来；
+    // 当天自动翻篇（force=false）保持严格，冲突仍进复核。
+    const shouldReview = (entry, index) =>
+      entry.certainty !== "clear"
+      || entry.evidenceType !== "explicit"
+      || !String(entry.evidence || "").trim()
+      || conflictsWithManual(entry)
+      || (!force && conflictsWithCandidate(entry, index));
+    const reviewItems = candidates.map((entry, index) => ({ entry, index })).filter(({ entry, index }) => shouldReview(entry, index));
+    reviewedCandidateCount = reviewItems.length;
+    if (reviewItems.length) {
+      // 老账补档时裁决倾向保留：有“我”的原话、语义清楚就信任模型的发现，只有完全无依据才丢；
+      // 当天自动仍维持严格口径（不臆造）。
+      const reviewGuide = force
+        ? `你是拾光记的复核者。下面是从${userName}可见对话中提取出的自动情绪候选（补档宽松模式）。只复核这些候选，不新增情绪，不改手动记录。只要候选有“我”的原话依据或上下文支持就倾向保留（同一时段出现不同情绪是正常的，一天本来就可能又烦又开心）；只有完全没有任何依据、或明显是伙伴的情绪/系统内容时才丢弃。`
+        : `你是拾光记的谨慎复核者。下面是从${userName}可见对话中提取出的自动情绪候选。只复核这些候选，不新增情绪，不改手动记录。若证据只是伙伴说话、没有“我”的原话、时间对不上、或同一时刻出现互相冲突的候选，就丢弃；证据足够时才保留。`;
+      const reviewPrompt =
+        `${reviewGuide}\n` +
+        `只输出 JSON 数组：[ { "index": 0, "decision": "keep|drop", "reason": "一句话" } ]\n` +
+        JSON.stringify(reviewItems.map(({ entry, index }) => ({
+          index,
+          mood: entry.label,
+          segment: entry.segment,
+          observedAt: entry.observedAt || "",
+          certainty: entry.certainty,
+          evidenceType: entry.evidenceType,
+          evidence: entry.evidence || "",
+          why: entry.note || "",
+        })), null, 2);
+      try {
+        const reviewRaw = await mcInstance.sample([{ role: "user", content: reviewPrompt }], {
+          maxTokens: 320,
+          temperature: 0.15,
+          timeoutMs: 30000,
+          callPurpose: "mood-discovery-review",
+          reasoningLevel: "off",
+          retryOnEmpty: false,
+        });
+        const decisions = parseMoodReviewOutput(reviewRaw, { allowedIndexes: reviewItems.map(({ index }) => index) });
+        const byIndex = new Map(decisions.map((item) => [item.index, item.keep]));
+        reviewedCount = decisions.filter((item) => byIndex.has(item.index)).length;
+        if (decisions.length) {
+          finalCandidates = candidates.filter((entry, index) => !byIndex.has(index) || byIndex.get(index));
+        }
+      } catch (e) {
+        // 复核失败时保留首轮候选，并把“未复核”留在状态里；不能因为附加调用失败误删自动发现。
+        logWarn(`${day} 自动情绪细致复核失败，保留首轮候选：${e?.message || e}`);
+      }
+    }
+  }
+
+  // force=true（历史补档）宽松合并：同段不同情绪共存；当天自动严格，保持原口径。
+  const merged = mergeMoodEntries(manual, finalCandidates, { lenient: force });
+  if (JSON.stringify(merged) !== JSON.stringify(manual)) await data.replaceDayMoods(day, merged);
+  const retainedAutoCount = merged.filter((entry) => entry.source === "auto").length;
+  await saveState({
+    status: "completed",
+    mode,
+    attemptedAt,
+    finishedAt: new Date().toISOString(),
+    candidateCount: candidates.length,
+    retainedAutoCount,
+    reviewedCandidateCount,
+    reviewedCount,
+    messageCount: rows.length,
+    explicitSignalCount: explicitSignals.length,
+  });
+  return {
+    ok: true,
+    candidateCount: candidates.length,
+    autoCount: retainedAutoCount,
+    mergedCount: merged.length,
+    reviewedCandidateCount,
+    reviewedCount,
+  };
+}
+
+function registerMoodRoutes(app) {
+  // 情绪集合（页面渲染用）
+  app.get("/api/moods/meta", async (c) => {
+    return c.json({ ok: true, moods: MOODS });
+  });
+
+  // 某月的情绪速览（时光册分月回看用：date → 当天 emoji 序列）
+  app.get("/api/moods", async (c) => {
+    try {
+      const url = new URL(c.req.url, "http://localhost");
+      const ym = String(url.searchParams.get("month") || "");
+      if (!/^\d{4}-\d{2}$/.test(ym)) return c.json({ ok: false, error: "月份格式不对" });
+      const data = getData();
+      const map = {};
+      for (const row of data.listMoods()) {
+        if (!String(row.date || "").startsWith(ym)) continue;
+        if (!map[row.date]) map[row.date] = [];
+        map[row.date].push(decorateMoodEntry(row));
+      }
+      return c.json({ ok: true, month: ym, days: map });
+    } catch (e) {
+      return c.json({ ok: false, error: e?.message || "读取失败" });
+    }
+  });
+
+  // 某天的情绪记录
+  app.get("/api/moods/:date", async (c) => {
+    const date = c.req.param("date");
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) return c.json({ ok: false, error: "日期格式不对" });
+    return c.json({ ok: true, date, moods: moodEntriesForDate(date), meta: MOODS });
+  });
+
+  // 记一笔当下的心情：手动标记，自动落当前时刻分段；date 默认今天
+  app.post("/api/moods", async (c) => {
+    try {
+      const body = (await c.req.json().catch(() => ({}))) || {};
+      const date = String(body.date || "").trim() || dateKey(new Date());
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) return c.json({ ok: false, error: "日期格式不对" });
+      const mood = normalizeMoodId(body.mood);
+      if (!mood) return c.json({ ok: false, error: "这个心情不在可选里，换一个吧" });
+      const now = new Date();
+      const entry = makeManualMood({ mood, segment: segmentOfHour(now.getHours()), reason: body.reason });
+      const moods = await getData().addMood(date, entry);
+      return c.json({ ok: true, date, moods: moods.map(decorateMoodEntry) });
+    } catch (e) {
+      return c.json({ ok: false, error: e?.message || "这条心情没记上" });
+    }
+  });
+
+  // 删除一条（手动可删，手滑不赖账）
+  app.delete("/api/moods/:date/:id", async (c) => {
+    try {
+      const date = c.req.param("date");
+      const id = c.req.param("id");
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) return c.json({ ok: false, error: "日期格式不对" });
+      await getData().removeMood(date, id);
+      return c.json({ ok: true, date, moods: moodEntriesForDate(date) });
+    } catch (e) {
+      return c.json({ ok: false, error: e?.message || "没删掉" });
+    }
+  });
+
+  // 编辑：给手动条目补/改 reason，给自动条目改 note（时间线可编辑）
+  app.put("/api/moods/:date/:id", async (c) => {
+    try {
+      const body = (await c.req.json().catch(() => ({}))) || {};
+      const date = c.req.param("date");
+      const id = c.req.param("id");
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) return c.json({ ok: false, error: "日期格式不对" });
+      const patch = {};
+      if (body.reason !== undefined) patch.reason = String(body.reason || "").trim().slice(0, 200);
+      if (body.note !== undefined) patch.note = String(body.note || "").trim().slice(0, 300);
+      const updated = await getData().updateMood(date, id, patch);
+      if (!updated) return c.json({ ok: false, error: "找不到这条心情" });
+      return c.json({ ok: true, mood: decorateMoodEntry(updated), moods: moodEntriesForDate(date) });
+    } catch (e) {
+      return c.json({ ok: false, error: e?.message || "没改上" });
+    }
+  });
 }
 
 export { mergeRetryOutcomes };
