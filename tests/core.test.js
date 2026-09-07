@@ -1,4 +1,4 @@
-// 拾光记 · 核心测试
+﻿// 拾光记 · 核心测试
 // 覆盖：加密存储、注入判定、节假日、数据层（事件/生理期/待办）
 //
 // 生活日边界（凌晨翻篇）按用户本机日期语义工作。测试用固定 +08:00 时刻表达
@@ -14,6 +14,7 @@ import fs from "node:fs";
 
 import { encryptJson, decryptJson, EncryptedStore, loadOrCreateKey } from "../lib/crypto-store.js";
 import { shouldInject, buildInjectionText, InjectionTracker } from "../lib/inject.js";
+import { decideDeepSeekNotice, getDeepSeekTimeInfo, isDeepSeekModel } from "../lib/deepseek-peak.js";
 import { getBuiltinFestivals, isWorkday, getMonthFestivals } from "../lib/festivals.js";
 import {
   UserData,
@@ -245,6 +246,110 @@ test("注入：Tracker 防膨胀", () => {
   assert.ok(t.sessions.size <= 500, "不应超过 500");
 });
 
+test("DeepSeek：第三方供应商的模型标识也能识别", () => {
+  assert.equal(isDeepSeekModel({ provider: "openrouter", id: "deepseek/deepseek-v4-flash" }), true);
+  assert.equal(isDeepSeekModel({ provider: "siliconflow", id: "deepseek-ai/DeepSeek-V3.2" }), true);
+  assert.equal(isDeepSeekModel({ provider: "openai", id: "gpt-5.6" }), false);
+});
+
+test("DeepSeek：北京时间峰谷和五分钟前预告窗口", () => {
+  const beforeMorningPeak = getDeepSeekTimeInfo(new Date("2026-09-07T08:55:00+08:00"));
+  assert.equal(beforeMorningPeak.period, "valley");
+  assert.equal(beforeMorningPeak.preview, true);
+  assert.equal(beforeMorningPeak.nextBoundary.at, "09:00");
+  assert.equal(beforeMorningPeak.nextBoundary.period, "peak");
+
+  const beforeNoonValley = getDeepSeekTimeInfo(new Date("2026-09-07T11:55:00+08:00"));
+  assert.equal(beforeNoonValley.period, "peak");
+  assert.equal(beforeNoonValley.preview, true);
+  assert.equal(beforeNoonValley.nextBoundary.at, "12:00");
+  assert.equal(beforeNoonValley.nextBoundary.period, "valley");
+
+  const weekend = getDeepSeekTimeInfo(new Date("2026-09-05T10:00:00+08:00"));
+  assert.equal(weekend.isWeekend, true);
+  assert.equal(weekend.period, "valley");
+  assert.equal(weekend.nextBoundary, null);
+});
+
+test("DeepSeek：首次识别、提前预告和错过预告后的补报只各触发一次", () => {
+  const model = { provider: "openrouter", id: "deepseek/deepseek-v4-flash" };
+  const first = decideDeepSeekNotice({
+    model,
+    now: new Date("2026-09-07T11:55:00+08:00"),
+  });
+  assert.equal(first.should, true);
+  assert.equal(first.notice.kind, "detected-preview");
+  assert.equal(first.notice.period, "peak");
+
+  const duringPreview = decideDeepSeekNotice({
+    model,
+    now: new Date("2026-09-07T11:58:00+08:00"),
+    lastState: first.state,
+  });
+  assert.equal(duringPreview.should, false);
+
+  const afterPreview = decideDeepSeekNotice({
+    model,
+    now: new Date("2026-09-07T12:02:00+08:00"),
+    lastState: duringPreview.state,
+  });
+  assert.equal(afterPreview.should, false, "已经提前预告过，跨过边界后不应再重复播报");
+
+  const missedPreview = decideDeepSeekNotice({
+    model,
+    now: new Date("2026-09-07T12:02:00+08:00"),
+    lastState: { dsActive: true, dsPeriod: "peak", dsPreviewKey: "" },
+  });
+  assert.equal(missedPreview.should, true);
+  assert.equal(missedPreview.notice.kind, "entered");
+  assert.equal(missedPreview.notice.period, "valley");
+
+  const weekendOpening = decideDeepSeekNotice({
+    model,
+    now: new Date("2026-09-05T10:00:00+08:00"),
+  });
+  assert.equal(weekendOpening.should, true);
+  assert.equal(weekendOpening.notice.isWeekend, true);
+  assert.equal(weekendOpening.notice.period, "valley");
+
+  const morningPreview = decideDeepSeekNotice({
+    model,
+    now: new Date("2026-09-07T08:55:00+08:00"),
+  });
+  const lunchPreview = decideDeepSeekNotice({
+    model,
+    now: new Date("2026-09-07T11:55:00+08:00"),
+    lastState: morningPreview.state,
+  });
+  const noonPreview = decideDeepSeekNotice({
+    model,
+    now: new Date("2026-09-07T13:55:00+08:00"),
+    lastState: lunchPreview.state,
+  });
+  assert.equal(noonPreview.notice.kind, "preview");
+  assert.deepEqual(noonPreview.state.dsPreviewKeys, [
+    "2026-09-07@09:00",
+    "2026-09-07@12:00",
+    "2026-09-07@14:00",
+  ]);
+  const afterAfternoonPeak = decideDeepSeekNotice({
+    model,
+    now: new Date("2026-09-07T18:02:00+08:00"),
+    lastState: noonPreview.state,
+  });
+  assert.equal(afterAfternoonPeak.should, true, "即使当前又回到谷时，也要补报中间错过的18点切换");
+  assert.equal(afterAfternoonPeak.notice.kind, "entered");
+
+  const afterOvernightGap = decideDeepSeekNotice({
+    model,
+    now: new Date("2026-09-08T08:30:00+08:00"),
+    lastState: noonPreview.state,
+  });
+  assert.equal(afterOvernightGap.should, true, "隔夜仍要补报已错过的18点边界");
+  assert.equal(afterOvernightGap.notice.kind, "entered");
+  assert.equal(afterOvernightGap.notice.period, "valley");
+});
+
 // ── 注入文本 ──
 test("注入文本：含特殊日子和待办", () => {
   const text = buildInjectionText({
@@ -259,6 +364,61 @@ test("注入文本：含特殊日子和待办", () => {
   assert.ok(text.includes("七夕"));
   assert.ok(text.includes("测试用户的生日"));
   assert.ok(text.includes("交稿"));
+});
+
+test("注入文本：DeepSeek 峰谷关照要求闲聊也硬带一句", () => {
+  const text = buildInjectionText({
+    now: new Date("2026-09-07T11:55:00+08:00"),
+    deepseekNotice: {
+      kind: "preview",
+      period: "peak",
+      periodLabel: "高峰时段",
+      previewMinutes: 5,
+      nextBoundary: { at: "12:00", periodLabel: "谷时段" },
+      toneIndex: 0,
+    },
+    recentSummaryOptions: { userName: "小满" },
+  });
+  assert.ok(text.includes("DeepSeek 系模型"), text);
+  assert.ok(text.includes("高峰时段"), text);
+  assert.ok(text.includes("5 分钟后"), text);
+  assert.ok(text.includes("谷时段"), text);
+  assert.ok(text.includes("哪怕当前只是闲聊也要自然带出一句"), text);
+  assert.ok(text.includes("小满"), text);
+  assert.ok(text.includes("模型峰谷关照属于硬触发"), text);
+  assert.ok(text.includes("峰时/谷时只表示模型费用时段和是否划算"), text);
+  assert.ok(text.includes("不要把它解释成交通拥堵"), text);
+  assert.ok(text.includes("所有可见表达只围绕费用和聊天成本"), text);
+
+  const enteredText = buildInjectionText({
+    now: new Date("2026-09-08T08:30:00+08:00"),
+    deepseekNotice: {
+      kind: "entered",
+      period: "valley",
+      periodLabel: "谷时段",
+      toneIndex: 0,
+    },
+  });
+  assert.ok(enteredText.includes("已经进入谷时段"), enteredText);
+  assert.ok(!enteredText.includes("刚刚已经进入"), enteredText);
+
+  const toneTexts = [0, 1, 2].map((toneIndex) => buildInjectionText({
+    now: new Date("2026-09-07T17:55:00+08:00"),
+    deepseekNotice: {
+      kind: "preview",
+      period: "peak",
+      periodLabel: "高峰时段",
+      previewMinutes: 5,
+      nextBoundary: { at: "18:00", period: "valley", periodLabel: "谷时段" },
+      toneIndex,
+    },
+  }));
+  for (const toneText of toneTexts) {
+    assert.ok(toneText.includes("咱们"), toneText);
+    assert.ok(!toneText.includes("你给我配的 DeepSeek"), toneText);
+    assert.ok(!toneText.includes("当前对话实际使用的是"), toneText);
+  }
+  assert.ok(toneTexts[2].includes("梁文峰") && toneTexts[2].includes("梁文谷"), toneTexts[2]);
 });
 
 test("注入文本：逾期待办只报条数，不逐条刷屏；今天到期照常列出", () => {
@@ -409,18 +569,67 @@ test("生活日总结：同日跨窗口时明确区分上一生活日与前一�
     ],
     recentSummaryOptions: { currentAgentId: "hanako", shared: false, proactiveDate: "2026-08-30" },
   });
-  assert.ok(text.includes("【已收好的上一生活日｜2026-08-30】"));
+  assert.ok(text.includes("【历史档案｜生活日 2026-08-30】"));
   assert.ok(text.includes("一起把日历整理好了"));
   assert.ok(text.includes("【近期回忆】"));
-  assert.ok(text.includes("属于已经结束的生活日 2026-08-30"));
-  assert.ok(text.includes("档案正文中的“昨天/今天”等相对日期词，也以这个生活日日期为准"));
-  assert.ok(text.includes("档案中的时间以 2026-08-30 为准"));
-  assert.ok(text.includes("不等于上一个聊天窗口"));
-  assert.ok(text.includes("同一自然日内的前一个对话框不属于这份档案"));
-  assert.ok(text.includes("今天早些时候"));
+  assert.ok(text.includes("每条事实的日期以行首的绝对日期为准"));
+  assert.ok(text.includes("档案只包含正文明确写出的事实"));
+  assert.ok(text.includes("代码注释、模型自身记忆、当前会话或其他窗口里的事实，都不能补写或归入生活日 2026-08-30"));
+  assert.ok(text.includes("当前对话的自然日期是 2026-08-31"));
+  assert.ok(text.includes("当前会话与同一自然日内的前一个对话框都属于 2026-08-31"));
+  assert.ok(text.includes("日期硬约束适用于所有可见回复和 MOOD"));
+  assert.ok(text.includes("上下文里标为“今天”或只写“凌晨/清晨/今早/上午/刚才”的事实，在没有更早绝对日期证据时按 2026-08-31 归属"));
+  assert.ok(text.includes("当前自然日内已经发生的这些事项，哪怕跨夜、熬夜或来自前一个对话框，也不能改称“昨晚/昨天”"));
+  assert.ok(text.includes("窗口先后不等于日期变化"));
+  assert.ok(text.includes("不要凭窗口顺序使用“昨天”；只有当前自然日期与事实日期的关系明确表示“昨天”时才这样说"));
+  assert.ok(text.includes("日期拿不准就用绝对日期或“今天早些时候/前一个对话框”"));
+  assert.ok(text.includes("明确属于生活日 2026-08-30、且确实写在档案正文里的事"));
+  assert.ok(text.includes("如果当前话题无关，不要为了证明记得而硬提"));
   assert.ok(text.includes("这段已经收好的生活有被记住"));
+  assert.ok(!text.includes("档案正文中的“昨天/今天”等相对日期词，也以这个生活日日期为准"));
+  assert.ok(!text.includes("以这个生活日日期为准"));
+  assert.ok(!text.includes("档案中的时间以 2026-08-30 为准"));
+  assert.ok(!text.includes("当前日期未提供"));
+  assert.ok(text.indexOf("2026-08-30：一起把日历整理好了") < text.indexOf("当前对话的自然日期是 2026-08-31"));
   assert.ok(!text.includes("【昨日回望】"));
   assert.ok(!text.includes("昨天的时光有被收好"));
+});
+
+test("生活日总结：同日新窗口不会把当前日期的工作说成昨天", () => {
+  const text = buildInjectionText({
+    now: new Date("2026-09-06T19:33:00+08:00"),
+    recentSummaries: [
+      { date: "2026-09-05", agentId: "hanako", agentName: "小花", text: "上一生活日的历史记录，今天拍板的刻度和心情线不在这里" },
+    ],
+    recentSummaryOptions: { currentAgentId: "hanako", proactiveDate: "2026-09-05", userName: "小满" },
+    force: true,
+  });
+  assert.ok(text.includes("当前对话的自然日期是 2026-09-06"));
+  assert.ok(text.includes("档案只包含正文明确写出的事实，代码注释、模型自身记忆、当前会话或其他窗口里的事实都不能补写进这份档案"));
+  assert.ok(text.includes("当前自然日内的前一个对话框仍属于 2026-09-06"));
+  assert.ok(text.includes("日期硬约束适用于所有可见回复和 MOOD"));
+  assert.ok(text.includes("上下文里标为“今天”或只写“凌晨/清晨/今早/上午/刚才”的事实，在没有更早绝对日期证据时按 2026-09-06 归属"));
+  assert.ok(text.includes("当前自然日内已经发生的这些事项，哪怕跨夜、熬夜或来自前一个对话框，也不能改称“昨晚/昨天”"));
+  assert.ok(text.includes("不要凭窗口顺序使用“昨天”；只有当前自然日期与事实日期的关系明确表示“昨天”时才这样说"));
+  assert.ok(text.includes("日期拿不准就用绝对日期或“今天早些时候/前一个对话框”"));
+  assert.ok(!text.includes("上一个聊天窗口不属于这份档案"));
+});
+
+test("日期语义：今天清晨的外部记忆不能在 MOOD 里变成昨晚", () => {
+  const text = buildInjectionText({
+    now: new Date("2026-09-07T08:05:00+08:00"),
+    recentSummaries: [
+      { date: "2026-09-06", agentId: "hanako", agentName: "小花", text: "2026-09-06 的历史档案" },
+    ],
+    recentSummaryOptions: { currentAgentId: "hanako", proactiveDate: "2026-09-06", userName: "小满" },
+    force: true,
+  });
+  assert.ok(text.includes("当前对话的自然日期是 2026-09-07"));
+  assert.ok(text.includes("日期硬约束适用于所有可见回复和 MOOD"));
+  assert.ok(text.includes("自然日期：2026-09-07；当前时刻：08:05"));
+  assert.ok(text.includes("上下文里标为“今天”或只写“凌晨/清晨/今早/上午/刚才”的事实，在没有更早绝对日期证据时按 2026-09-07 归属"));
+  assert.ok(text.includes("不能改称“昨晚/昨天”"));
+  assert.ok(!text.includes("以这个生活日日期为准"));
 });
 
 test("注入文本：旧总结调用方也使用带日期的生活日标签", () => {
@@ -430,6 +639,8 @@ test("注入文本：旧总结调用方也使用带日期的生活日标签", ()
     force: true,
   });
   assert.ok(text.includes("已收好的生活日回顾｜2026-08-30：旧调用方的总结"));
+  assert.ok(text.includes("当前对话的自然日期是 2026-08-31"));
+  assert.ok(text.includes("当前自然日内的前一个对话框仍属于 2026-08-31"));
   assert.ok(!text.includes("昨日回顾："));
 });
 

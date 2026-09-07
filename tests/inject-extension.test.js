@@ -12,7 +12,7 @@ import { __setSharedUserDataForTest } from "../lib/shared-data.js";
 // 用临时数据目录隔离测试数据；扩展注册时的天气检查也不会触碰真实配置。
 const TEST_DATA_DIR = path.join(os.tmpdir(), `sgj-ext-test-${Date.now()}`);
 
-import registerShiguangjiInject, { __resetLazySummaryForTest, resolveAgentId } from "../extensions/inject.js";
+import registerShiguangjiInject, { __resetLazySummaryForTest, resolveAgentId, resolveCurrentModel } from "../extensions/inject.js";
 
 before(() => {
   fs.mkdirSync(TEST_DATA_DIR, { recursive: true });
@@ -34,6 +34,12 @@ test("扩展：伙伴身份优先取上下文，缺失时从会话路径回退",
   assert.equal(resolveAgentId({}, { agentId: "hanako" }), "hanako");
   assert.equal(resolveAgentId({}, { sessionManager: { getSessionFile: () => "C:\\Users\\test\\.hanako\\agents\\partner-two\\sessions\\s.jsonl" } }), "partner-two");
   assert.equal(resolveAgentId({}, { sessionManager: { getSessionFile: () => "C:\\Users\\test\\other\\s.jsonl" } }), "");
+});
+
+test("扩展：当前上下文模型优先于事件模型", () => {
+  const ctxModel = { provider: "openrouter", id: "deepseek/deepseek-v4-flash" };
+  assert.equal(resolveCurrentModel({ model: { provider: "openai", id: "gpt-5.6" } }, { model: ctxModel }), ctxModel);
+  assert.deepEqual(resolveCurrentModel({ model: ctxModel }, {}), ctxModel);
 });
 
 test("扩展：注册 before_agent_start 处理器", () => {
@@ -182,6 +188,24 @@ test("扩展：注入失败不抛错（数据目录不可写也安全）", async
     threw = true;
   }
   assert.equal(threw, false, "不应抛错");
+});
+
+test("扩展：DeepSeek 首次识别硬触发，同一时段不重复", () => {
+  const data = new UserData(path.join(os.tmpdir(), `sgj-deepseek-ext-${Date.now()}-${Math.random().toString(36).slice(2)}`));
+  __setSharedUserDataForTest(data);
+  const pi = makePi();
+  registerShiguangjiInject(pi);
+  const ctx = {
+    model: { provider: "openrouter", id: "deepseek/deepseek-v4-flash" },
+    sessionManager: { getSessionId: () => "deepseek-session" },
+  };
+  const first = pi._handlers["before_agent_start"]({}, ctx);
+  assert.ok(first?.message, "首次识别 DeepSeek 必须带关照");
+  assert.ok(first.message.content.includes("DeepSeek 系模型"), first.message.content);
+  assert.equal(first.message.details.deepseekNotice, true);
+  const second = pi._handlers["before_agent_start"]({}, ctx);
+  assert.equal(second, undefined, "同一聊天框同一时段不应每轮重复");
+  __setSharedUserDataForTest(new UserData(TEST_DATA_DIR));
 });
 
 test("扩展：新会话返回注入消息结构（display:false）", () => {

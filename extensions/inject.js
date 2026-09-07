@@ -22,6 +22,7 @@ import {
   weatherCacheMatches,
 } from "../lib/weather.js";
 import { configureDebugLog, logInfo } from "../lib/debug-log.js";
+import { decideDeepSeekNotice } from "../lib/deepseek-peak.js";
 
 const tracker = new InjectionTracker();
 let weatherTimer = null; // 天气惰性刷新定时器
@@ -62,6 +63,7 @@ export default function registerShiguangjiInject(pi) {
       const now = new Date();
       const injectionEnabled = settings.injectionEnabled !== false;
       const lastState = tracker.get(sessionId);
+      const currentModel = resolveCurrentModel(event, ctx);
       const dataRev = data.getDataRev();
       const contextKey = JSON.stringify({
         mode: settings.injectMode || "balanced",
@@ -94,6 +96,12 @@ export default function registerShiguangjiInject(pi) {
         });
         return undefined;
       }
+
+      const deepseekDecision = decideDeepSeekNotice({
+        model: currentModel,
+        now,
+        lastState,
+      });
 
       // 收集当天情境。预计中的生理期不作为确定事实注入。
       const builtin = getBuiltinFestivals(now);
@@ -158,11 +166,26 @@ export default function registerShiguangjiInject(pi) {
           newState: { ...lastState, lastInjectAt: now.getTime(), lastDateKey: (decision.newState && decision.newState.lastDateKey) || lastState.lastDateKey },
         };
       }
-      const decisionState = { ...decision.newState, contextKey, lastDataRev: dataRev, injectionEnabled: true };
-
-      if (!decision.should) {
+      const decisionState = {
+        ...decision.newState,
+        ...deepseekDecision.state,
+        contextKey,
+        lastDataRev: dataRev,
+        injectionEnabled: true,
+      };
+      const deepseekForced = deepseekDecision.should;
+      if (!decision.should && !deepseekForced) {
         tracker.set(sessionId, decisionState);
         return undefined;
+      }
+      if (deepseekForced) {
+        decisionState.lastInjectAt = now.getTime();
+        decision = {
+          ...decision,
+          should: true,
+          reason: `deepseek-${deepseekDecision.reason}`,
+          newState: decisionState,
+        };
       }
 
       // 近期总结：先按当前伙伴身份做权限过滤，再取最近 3 个已结束生活日；
@@ -208,6 +231,7 @@ export default function registerShiguangjiInject(pi) {
           userName,
         },
         weather,
+        deepseekNotice: deepseekDecision.notice,
         includeTime: settings.injectMode !== "economical",
         force: decision.reason === "new-session" || decision.reason === "day-changed" || decision.reason === "injection-enabled",
         periodEndedYesterday,
@@ -232,7 +256,7 @@ export default function registerShiguangjiInject(pi) {
 
       // 内容 hash 去重：同一会话同一内容不重复注入
       const hash = crypto.createHash("sha1").update(text).digest("hex");
-      if (lastState && lastState.lastHash === hash && decision.reason !== "day-changed" && decision.reason !== "settings-changed" && decision.reason !== "injection-enabled") {
+      if (lastState && lastState.lastHash === hash && !deepseekForced && decision.reason !== "day-changed" && decision.reason !== "settings-changed" && decision.reason !== "injection-enabled") {
         tracker.set(sessionId, { ...decisionState, lastHash });
         return undefined;
       }
@@ -247,6 +271,7 @@ export default function registerShiguangjiInject(pi) {
           details: {
           injector: "shiguangji",
           reason: decision.reason,
+          deepseekNotice: deepseekForced,
           summaryCount: recent.entries.length,
           summaryExpanded: recent.expanded,
         },
@@ -276,6 +301,16 @@ function extractPrompt(event) {
     return value.map((part) => typeof part === "string" ? part : part?.text || "").join(" ").slice(0, 2000);
   }
   return "";
+}
+
+export function resolveCurrentModel(event, ctx) {
+  try {
+    const model = ctx?.model;
+    if (model) return model;
+  } catch {
+    // 旧宿主或尚未绑定模型时，继续尝试事件字段。
+  }
+  return event?.model || event?.currentModel || event?.modelInfo || null;
 }
 
 export function resolveAgentId(event, ctx) {

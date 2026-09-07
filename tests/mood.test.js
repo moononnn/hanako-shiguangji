@@ -56,7 +56,7 @@ test("情绪集合：13 个词、id 唯一、emoji 唯一", () => {
   assert.equal(new Set(MOODS.map((m) => m.id)).size, MOODS.length);
   assert.equal(new Set(MOODS.map((m) => m.emoji)).size, MOODS.length);
   assert.equal(new Set(MOODS.map((m) => m.label)).size, MOODS.length);
-    for (const label of ["开心", "平静", "兴奋", "委屈", "难过", "生气", "烦躁", "焦虑", "累", "感动", "无聊", "幸福", "想念"]) {
+  for (const label of ["开心", "平静", "兴奋", "委屈", "难过", "生气", "烦躁", "焦虑", "累", "感动", "无聊", "幸福", "想念"]) {
     assert.ok(MOODS.some((m) => m.label === label), `缺少情绪词：${label}`);
   }
 });
