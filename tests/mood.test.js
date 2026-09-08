@@ -552,6 +552,59 @@ test("路由：自动情绪日终批量分析保留真实时刻且每天只调�
   assert.match(result.stdout, /"precision":"turn"/);
 });
 
+test("路由：自动情绪空正文记为失败并给出工具模型自救路径", () => {
+  const isolatedHome = fs.mkdtempSync(path.join(os.tmpdir(), "sgj-mood-empty-route-"));
+  const routeUrl = pathToFileURL(path.resolve("routes/ui.js")).href;
+  const dataUrl = pathToFileURL(path.resolve("lib/data.js")).href;
+  const childCode = `
+    import fs from "node:fs";
+    import path from "node:path";
+    import os from "node:os";
+    import { UserData } from ${JSON.stringify(dataUrl)};
+    import registerRoutes from ${JSON.stringify(routeUrl)};
+    const home = path.join(os.homedir(), ".hanako");
+    const agents = path.join(home, "agents", "hanako");
+    const sessions = path.join(agents, "sessions");
+    const dataDir = path.join(home, "plugin-data", "shiguangji");
+    fs.mkdirSync(sessions, { recursive: true });
+    fs.writeFileSync(path.join(home, "users.json"), JSON.stringify({ displayName: "小测试" }));
+    fs.writeFileSync(path.join(agents, "config.yaml"), "agent:\\n  name: 小花\\n");
+    fs.writeFileSync(path.join(sessions, "one.jsonl"), JSON.stringify({ type: "message", timestamp: "2026-09-05T10:00:00+08:00", message: { role: "user", content: "今天有点焦虑" } }) + "\\n");
+    const data = new UserData(dataDir);
+    await data.updateSettings({ autoSummary: false, moodDiscoveryMode: "economical", modelSource: "agent" });
+    const routes = [];
+    const app = {
+      get(path, handler) { routes.push({ method: "GET", path, handler }); },
+      post(path, handler) { routes.push({ method: "POST", path, handler }); },
+      put(path, handler) { routes.push({ method: "PUT", path, handler }); },
+      delete(path, handler) { routes.push({ method: "DELETE", path, handler }); },
+    };
+    registerRoutes(app, {
+      dataDir,
+      bus: { async request(topic, input) {
+        if (input.callPurpose === "mood-discovery") return { text: "" };
+        return { text: "小测试今天和小花聊了几句" };
+      } },
+      log: { info() {}, warn() {}, error() {} },
+    });
+    const run = routes.find((item) => item.method === "POST" && item.path === "/api/summaries/run");
+    const result = await run.handler({ req: { async json() { return { date: "2026-09-05" }; } }, json(value) { return value; } });
+    const state = new UserData(dataDir).getMoodHarvestState("2026-09-05");
+    if (!result.ok || result.mood?.ok !== false) throw new Error("空正文没有单独标成情绪失败：" + JSON.stringify(result));
+    if (!/工具模型通道/.test(result.mood.error || "")) throw new Error("缺少自救引导：" + JSON.stringify(result.mood));
+    if (!state || state.status !== "failed") throw new Error("空正文被误记为完成：" + JSON.stringify(state));
+    console.log(JSON.stringify({ mood: result.mood, state: state.status }));
+  `;
+  const result = spawnSync(process.execPath, ["--input-type=module", "-e", childCode], {
+    encoding: "utf8",
+    cwd: path.resolve("."),
+    env: { ...process.env, USERPROFILE: isolatedHome, HOME: isolatedHome, HANA_HOME: path.join(isolatedHome, ".hanako") },
+  });
+  assert.equal(result.status, 0, result.stderr || result.stdout);
+  assert.match(result.stdout, /"state":"failed"/);
+  assert.match(result.stdout, /工具模型通道/);
+});
+
 test("路由：细致档位只对存疑候选追加一次裁决", () => {
   const isolatedHome = fs.mkdtempSync(path.join(os.tmpdir(), "sgj-mood-detailed-route-"));
   const routeUrl = pathToFileURL(path.resolve("routes/ui.js")).href;

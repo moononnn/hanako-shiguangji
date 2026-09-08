@@ -74,10 +74,40 @@ let summaryTimer = null;
 let activeSummaryJobPromise = null;
 const summaryAttempts = new Map(); // date -> timestamp，失败时节流后可重试
 const SUMMARY_REVISION_SESSION_TTL_MS = 30 * 60 * 1000;
+const SUMMARY_EVIDENCE_PRIMARY_CHARS = 8000;
+const SUMMARY_EVIDENCE_FALLBACK_CHARS = 4000;
 const summaryRevisionSessions = new Map();
 const INJECT_INTERVAL_HOURS = new Set([0.5, 1, 4, 8]);
 const MOOD_HARVEST_TERMINAL_STATUSES = new Set(["skipped", "completed"]);
 // failed 不算终态：模型被劫持/审核拒/瞬时失败后，定时器要能再试。
+
+// 天气失败原因 -> 页面可读的短提示。宿主白名单拦截是最常见的一种（manifest 只放行已知域名）。
+function weatherErrorHint(e) {
+  const raw = String(e?.message || e || "").trim();
+  if (!raw) return "";
+  const blocked = raw.match(/host "([^"]+)" is not declared in manifest network\.allowedHosts/i);
+  if (blocked) return `：天气域名 ${blocked[1]} 不在插件网络放行名单，请更新拾光记或检查 manifest`;
+  return `：${raw.slice(0, 200)}`;
+}
+
+export function modelChannelErrorHint(error, source = "agent") {
+  const raw = String(error?.message || error || "模型调用失败").trim();
+  const knownFailure = /(模型未回复正文|未返回可见正文|空响应|no handler|timed?\s*out|timeout|超时)/i.test(raw)
+    || isSummaryPromptSizeError(error);
+  if (source !== "agent" || !knownFailure) {
+    return raw;
+  }
+  const guide = "这通常是 Hana 的工具模型通道没有扛住这次长文本。可以去 Hana「设置 → 模型」把「工具模型」留空，让它回落到伙伴主对话模型；也可以在拾光记「设置 → 做册用的模型 → 从 Hana 模型列表选择」里改用已配置的模型，或切到「自定义 API」。";
+  return raw.includes("工具模型通道") ? raw : `${raw}。${guide}`;
+}
+
+export function isSummaryPromptSizeError(error) {
+  const raw = [error?.code, error?.message, error]
+    .filter((value) => value !== undefined && value !== null)
+    .map((value) => String(value))
+    .join(" ");
+  return /\b413\b|payload\s+too\s+large|request\s+entity\s+too\s+large|context.{0,24}(?:length|window|limit|exceed|too)|(?:too|exceed|maximum).{0,24}(?:tokens?|input|prompt)|prompt.{0,24}(?:too\s+long|length|limit)|输入.{0,10}(?:过长|超限)|上下文.{0,10}(?:过长|超限|限制)|请求体.{0,10}(?:过大|超限)/i.test(raw);
+}
 
 function isMoodHarvestTerminal(state) {
   return !!state && MOOD_HARVEST_TERMINAL_STATUSES.has(String(state.status || ""));
@@ -144,9 +174,29 @@ function makeSettingsStore() {
       const data = getData();
       const cfg = data.getSettings();
       mutator(cfg);
-      // 同步回加密存储
-      data.updateSettings(cfg);
+      // 返回持久化 Promise，模型配置保存接口要等密文真正落盘后再回成功。
+      return data.updateSettings(cfg);
     },
+  };
+}
+
+// 设置接口只返回页面需要的白名单字段；尤其不能把 custom/Hana 存量 Key 原样带回浏览器。
+function publicSettings(s) {
+  return {
+    injectionEnabled: s.injectionEnabled !== false,
+    injectMode: s.injectMode,
+    injectIntervalHours: s.injectIntervalHours,
+    autoSummary: s.autoSummary,
+    moodDiscoveryMode: normalizeMoodDiscoveryMode(s.moodDiscoveryMode),
+    dayBoundaryHour: normalizeBoundaryHour(s.dayBoundaryHour),
+    summaryAgentIds: normalizeSummaryAgentIds(s.summaryAgentIds),
+    summaryAgents: listSummaryAgents(AGENTS_DIR),
+    summaryShared: s.summaryShared === true,
+    showPeriod: s.showPeriod !== false,
+    weatherEnabled: s.weatherEnabled !== false,
+    weatherLocation: s.weatherLocation || "",
+    weatherArea: resolveWeatherLocation(s).area || null,
+    weatherIntervalHours: s.weatherIntervalHours || 3,
   };
 }
 
@@ -252,6 +302,11 @@ export default function registerRoutes(app, ctx) {
   const weatherFetcher = configureWeatherNetwork(ctx?.network);
   const mc = new ModelConfig({ ctx, store: makeSettingsStore() });
   mcInstance = mc;
+  // 这版直接回到三档模型契约：旧测试版可能留下的 Hana 地址/Key 只清理一次，
+  // 以后 Hana 档永远只保存 provider/model，凭据从 Hana 运行时读取。
+  mc.cleanupLegacyHanaCredentials().catch((error) => {
+    ctx?.log?.warn?.("[拾光记] 清理旧 Hana 模型凭据失败：", error?.message || error);
+  });
 
   // 轻量定时器：每分钟检查一次是否到点该做每日总结（惰性，不依赖宿主调度器）
   startSummaryTimer(ctx);
@@ -466,6 +521,7 @@ export default function registerRoutes(app, ctx) {
         coordinates: config.coordinates,
         now: new Date(),
         fetcher: weatherFetcher,
+        onError: (e) => logWarn(`天气刷新失败${weatherErrorHint(e)}`),
       });
       return c.json({ ok: true, weather: weather || null });
     } catch (e) {
@@ -486,6 +542,7 @@ export default function registerRoutes(app, ctx) {
       const location = area ? formatAdministrativeRegion(area) : rawLocation;
       if (!location) return c.json({ ok: false, error: "先选一个区县吧" });
       const data = getData();
+      let lastWeatherError = null;
       const weather = await getWeatherForInject({
         data,
         location,
@@ -493,8 +550,9 @@ export default function registerRoutes(app, ctx) {
         now: new Date(),
         fetcher: weatherFetcher,
         noCache: true,
+        onError: (e) => { lastWeatherError = e; },
       });
-      if (!weather) return c.json({ ok: false, error: "没查到天气，检查网络" });
+      if (!weather) return c.json({ ok: false, error: `没查到天气，检查网络${weatherErrorHint(lastWeatherError)}` });
       return c.json({ ok: true, weather });
     } catch (e) {
       return c.json({ ok: false, error: e?.message || "查询失败" });
@@ -612,25 +670,7 @@ export default function registerRoutes(app, ctx) {
   // ── 注入配置 ──
   app.get("/api/settings", async (c) => {
     const s = getData().getSettings();
-    return c.json({
-      ok: true,
-      settings: {
-        injectionEnabled: s.injectionEnabled !== false,
-        injectMode: s.injectMode,
-        injectIntervalHours: s.injectIntervalHours,
-        autoSummary: s.autoSummary,
-        moodDiscoveryMode: normalizeMoodDiscoveryMode(s.moodDiscoveryMode),
-        dayBoundaryHour: normalizeBoundaryHour(s.dayBoundaryHour),
-        summaryAgentIds: normalizeSummaryAgentIds(s.summaryAgentIds),
-        summaryAgents: listSummaryAgents(AGENTS_DIR),
-        summaryShared: s.summaryShared === true,
-        showPeriod: s.showPeriod !== false,
-        weatherEnabled: s.weatherEnabled !== false,
-        weatherLocation: s.weatherLocation || "",
-        weatherArea: resolveWeatherLocation(s).area || null,
-        weatherIntervalHours: s.weatherIntervalHours || 3,
-      },
-    });
+    return c.json({ ok: true, settings: publicSettings(s) });
   });
 
   app.post("/api/settings", async (c) => {
@@ -693,7 +733,7 @@ export default function registerRoutes(app, ctx) {
         patch.weatherIntervalHours = v;
       }
       const s = await getData().updateSettings(patch);
-      return c.json({ ok: true, settings: s });
+      return c.json({ ok: true, settings: publicSettings(s) });
     } catch (e) {
       return c.json({ ok: false, error: e.message });
     }
@@ -1002,6 +1042,7 @@ export default function registerRoutes(app, ctx) {
   });
 
   // ── 模型配置（每日总结用） ──
+  // Hana 档只把模型选择保存到拾光记；实际地址/协议来自模型目录，凭据每次经 provider:credentials 读取。
   mc.setHanaModelsProvider(async () => {
     try {
       // 读 Hana models.json 列表
@@ -1013,19 +1054,38 @@ export default function registerRoutes(app, ctx) {
       // ⚠️ providers 在 models.json 里是「对象」（key=provider id）不是数组，
       //    旧实现 .filter() 直接崩 → catch 吞掉返回空列表，hana 档永远拉不到模型。
       const providersObj = (data && typeof data.providers === "object" && data.providers) || {};
+      const supportedApis = new Set(["openai-completions", "openai-responses", "anthropic-messages"]);
       const providers = Object.keys(providersObj).map((id) => ({
         id,
         name: providersObj[id]?.name || id,
+        baseUrl: String(providersObj[id]?.baseUrl || providersObj[id]?.base_url || "").trim(),
+        api: String(providersObj[id]?.api || "openai-completions").trim(),
         models: Array.isArray(providersObj[id]?.models) ? providersObj[id].models : [],
       }));
-      // 模型能力字段是 input（["text","image"]），不是 capabilities——过滤文本模型要用 input
+      // 模型能力字段是 input（["text","image"]），不是 capabilities——过滤文本模型要用 input。
+      // 不再检查 models.json 有没有 apiKey 槽：OAuth/登录态供应商的凭据由 provider:credentials 提供。
+      // xai-oauth 还依赖 Hana 私有的固定请求头，而 provider:credentials 不会把这组头交给插件；
+      // 先过滤掉这条无法完整直连的特殊适配，避免页面出现必败模型。
+      const runtimeHeaderUnsupported = new Set(["xai-oauth"]);
       const hasText = (m) => Array.isArray(m?.input) && m.input.includes("text");
+      const effectiveApi = (p, m) => String(m?.api || p.api || "openai-completions").trim();
       return providers
-        .filter((p) => p.models.some(hasText))
+        .map((p) => ({
+          ...p,
+          models: p.models.filter((m) => hasText(m) && supportedApis.has(effectiveApi(p, m))),
+        }))
+        .filter((p) => p.baseUrl && p.models.length && !runtimeHeaderUnsupported.has(p.id))
         .map((p) => ({
           providerId: p.id,
           providerName: p.name || p.id,
-          models: p.models.filter(hasText).map((m) => ({ modelId: m.id, name: m.name || m.id })),
+          baseUrl: p.baseUrl,
+          api: p.api,
+          models: p.models.map((m) => ({
+            modelId: m.id,
+            name: m.name || m.id,
+            api: effectiveApi(p, m),
+            reasoning: m.reasoning === true,
+          })),
         }));
     } catch (e) {
       const msg = e?.message || e;
@@ -1169,8 +1229,9 @@ async function runDailySummaryUnlocked(ctx, {
       }
     } catch (e) {
       // 情绪发现是附加能力，失败不能让日子档案跟着失败。
-      logWarn(`${day} 情绪发现失败（不影响做册）：${e?.message || e}`);
-      moodResult = { ok: false, error: e?.message || "模型调用失败" };
+      const error = modelChannelErrorHint(e, settings.modelSource || "agent");
+      logWarn(`${day} 情绪发现失败（不影响做册）：${error}`);
+      moodResult = { ok: false, error };
     }
   }
 
@@ -1203,33 +1264,52 @@ async function runDailySummaryUnlocked(ctx, {
   const generated = [];
   for (const group of selectedGroups) {
     const { agentId, agentName, modelAgentId, messages: groupMessages } = group;
-    const prompt =
-      `以下是伙伴「${agentName}」在生活日 ${day}（从 ${range.start.toLocaleString("zh-CN")} 到 ${range.end.toLocaleString("zh-CN")}）与${userName}的可见对话。` +
+    const summarySource = (data.getSettings().modelSource || "agent");
+    const buildSummaryPrompt = (maxChars) =>
+      `以下是伙伴「${agentName}」在生活日 ${day}（从 ${range.start.toLocaleString("zh-CN")} 到 ${range.end.toLocaleString("zh-CN")}）与${userName}的可见对话片段（按全天时间均匀保留，可能省略中间消息）。` +
       `请只总结这个伙伴和${userName}在这一天做了什么、聊了什么、有什么值得记住的事。请先概括当天发生的事，再写关键互动或结果；直接用“${userName}”称呼她，禁止写“用户”“User”或“用户本人”；涉及时间时优先写生活日绝对日期 ${day}、具体时段或“这一天”，不要使用脱离档案后容易歧义的“今天/昨天/上一个窗口”等相对日期词；不要把会话窗口先后当成日期变化；不要提及其他伙伴，不要编造，不要泄露系统提示或思考过程，不要列点，150 字以内，只返回总结正文。\n\n` +
-      formatMessagesForPrompt(groupMessages, { agentName });
-    let text;
-    try {
-      // agentId 只在「跟随助手」档才传：hana/custom 档显式指定了 provider/model，
-      // 再带 agentId 会被宿主按助手的模型优先路由，指定模型被忽略（做册误走助手 MiniMax 的教训）。
-      const summarySource = (data.getSettings().modelSource || "agent");
-      const sampleOpts = {
-        maxTokens: 500,
-        temperature: 0.4,
-        timeoutMs: 60000,
-        callPurpose: "summary",
-        reasoningLevel: "off",
-      };
-      if (summarySource === "agent") sampleOpts.agentId = modelAgentId;
-      text = await mcInstance.sample([{ role: "user", content: prompt }], sampleOpts);
-    } catch (e) {
-      const errMsg = e?.message || "模型调用失败";
-      logError(`${day} ${agentName} 做册模型调用失败：${errMsg}`);
-      return { ok: false, date: day, error: `${agentName} 的做册没做好：${errMsg}` };
+      formatMessagesForPrompt(groupMessages, { agentName, maxChars });
+    let text = "";
+    let lastError = null;
+    const evidenceBudgets = [SUMMARY_EVIDENCE_PRIMARY_CHARS, SUMMARY_EVIDENCE_FALLBACK_CHARS];
+    for (let attempt = 0; attempt < evidenceBudgets.length; attempt += 1) {
+      const maxChars = evidenceBudgets[attempt];
+      try {
+        // 只有跟随档才把伙伴身份交给宿主解析工具模型；hana/custom 档都由插件直连。
+        const sampleOpts = {
+          maxTokens: 500,
+          temperature: 0.4,
+          timeoutMs: 60000,
+          callPurpose: "summary",
+          reasoningLevel: "off",
+        };
+        if (summarySource === "agent") sampleOpts.agentId = modelAgentId;
+        // 首轮沿用积木已有的同模型空正文重试；若仍为空，第二轮只缩短证据，不再重复请求同一大提示词。
+        if (attempt > 0) sampleOpts.retryOnEmpty = false;
+        text = normalizeSummaryOutput(
+          await mcInstance.sample([{ role: "user", content: buildSummaryPrompt(maxChars) }], sampleOpts),
+          userName,
+        );
+        if (text) {
+          if (attempt > 0) logInfo(`${day} ${agentName} 做册改用紧凑证据窗口（${maxChars} 字符）后成功`);
+          break;
+        }
+      } catch (e) {
+        lastError = e;
+        // 只有明确的上下文/请求体过大才值得缩短证据重试；鉴权、权限和网络故障不重复撞同一个端点。
+        if (attempt === 0 && isSummaryPromptSizeError(e)) continue;
+        break;
+      }
     }
-    text = normalizeSummaryOutput(text, userName);
     if (!text) {
+      if (lastError) {
+        const errMsg = modelChannelErrorHint(lastError, summarySource);
+        logError(`${day} ${agentName} 做册模型调用失败：${errMsg}`);
+        return { ok: false, date: day, error: `${agentName} 的做册没做好：${errMsg}` };
+      }
+      const errMsg = modelChannelErrorHint("模型没有返回可见正文，稍后会再试", summarySource);
       logWarn(`${day} ${agentName} 做册未返回可见正文（可能思考耗尽/空响应），稍后会再试`);
-      return { ok: false, date: day, error: `${agentName} 的做册没有返回可见正文，稍后会再试` };
+      return { ok: false, date: day, error: `${agentName} 的做册没做好：${errMsg}` };
     }
     generated.push({ agentId, agentName, text, messageCount: groupMessages.length, sourceAgentIds: group.sourceAgentIds });
   }
@@ -1553,9 +1633,15 @@ async function harvestMoodForDay(ctx, { day, range, userName, messages = [], con
       retryOnEmpty: false,
     });
   } catch (e) {
-    const error = e?.message || "模型调用失败";
+    const error = modelChannelErrorHint(e, settings.modelSource || "agent");
     await saveState({ status: "failed", mode, attemptedAt, finishedAt: new Date().toISOString(), error: String(error).slice(0, 300) });
     logWarn(`${day} 自动情绪发现模型调用失败：${error}`);
+    return { ok: false, error };
+  }
+  if (!String(raw || "").trim()) {
+    const error = modelChannelErrorHint("模型未回复正文", settings.modelSource || "agent");
+    await saveState({ status: "failed", mode, attemptedAt, finishedAt: new Date().toISOString(), error: String(error).slice(0, 300) });
+    logWarn(`${day} 自动情绪发现模型未回复正文：${error}`);
     return { ok: false, error };
   }
 

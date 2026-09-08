@@ -6,6 +6,7 @@ import path from "node:path";
 import { spawnSync } from "node:child_process";
 import { pathToFileURL } from "node:url";
 import { parseTodoReminderText } from "../lib/todo-time.js";
+import { isSummaryPromptSizeError, modelChannelErrorHint } from "../routes/ui.js";
 
 // 用隔离的 USERPROFILE 启动真实路由，避免测试触碰用户的拾光记数据。
 test("路由：日期详情接口能正常读取当天数据", () => {
@@ -223,6 +224,40 @@ test("路由：30 分钟注入间隔可保存并跨实例回读", () => {
   assert.match(result.stdout, /"reopened":0\.5/);
 });
 
+test("路由：设置保存响应不暴露模型 Key", () => {
+  const isolatedHome = fs.mkdtempSync(path.join(os.tmpdir(), "sgj-settings-redaction-test-"));
+  const routeUrl = pathToFileURL(path.resolve("routes/ui.js")).href;
+  const dataUrl = pathToFileURL(path.resolve("lib/data.js")).href;
+  const childCode = `
+    import path from "node:path";
+    import { UserData } from ${JSON.stringify(dataUrl)};
+    import registerRoutes from ${JSON.stringify(routeUrl)};
+    const data = new UserData(path.join(process.env.HANA_HOME, "plugin-data", "shiguangji"));
+    await data.settings.update((settings) => {
+      settings.hanaModel = { providerId: "p", modelId: "m", apiKey: "hana-secret" };
+      settings.customModel = { baseUrl: "https://api.example", model: "m", apiKey: "custom-secret" };
+    });
+    const routes = [];
+    const app = {
+      get(path, handler) { routes.push({ method: "GET", path, handler }); },
+      post(path, handler) { routes.push({ method: "POST", path, handler }); },
+      put() {}, delete() {},
+    };
+    registerRoutes(app, { log: { info() {}, warn() {}, error() {} } });
+    const post = routes.find((item) => item.method === "POST" && item.path === "/api/settings");
+    const saved = await post.handler({ req: { async json() { return { injectMode: "always" }; } }, json(value) { return value; } });
+    if (saved.settings.hanaModel || saved.settings.customModel) throw new Error("设置响应不应带模型配置");
+    if (JSON.stringify(saved).includes("secret")) throw new Error("设置响应泄漏了模型 Key");
+    console.log(JSON.stringify(saved));
+  `;
+  const result = spawnSync(process.execPath, ["--input-type=module", "-e", childCode], {
+    encoding: "utf8",
+    env: { ...process.env, USERPROFILE: isolatedHome, HOME: isolatedHome, HANA_HOME: path.join(isolatedHome, ".hanako") },
+  });
+  assert.equal(result.status, 0, result.stderr || result.stdout);
+  assert.doesNotMatch(result.stdout, /hana-secret|custom-secret/);
+});
+
 test("路由：情境注入与天气开关独立保存，关闭天气不查询且不回显缓存", () => {
   const isolatedHome = fs.mkdtempSync(path.join(os.tmpdir(), "sgj-context-weather-route-test-"));
   const routeUrl = pathToFileURL(path.resolve("routes/ui.js")).href;
@@ -437,7 +472,7 @@ test("路由：整理一天时按伙伴调用模型并分别归档", () => {
   assert.match(result.stdout, /partner-two/);
 });
 
-test("路由：hana 档指定做册模型时，总结调用不带 agentId（防被宿主按助手模型路由）", () => {
+test("路由：Hana 档按所选模型直连，不经过工具模型总线", () => {
   const isolatedHome = fs.mkdtempSync(path.join(os.tmpdir(), "sgj-summary-hana-model-route-test-"));
   const routeUrl = pathToFileURL(path.resolve("routes/ui.js")).href;
   const dataUrl = pathToFileURL(path.resolve("lib/data.js")).href;
@@ -450,15 +485,21 @@ test("路由：hana 档指定做册模型时，总结调用不带 agentId（防�
     const home = path.join(os.homedir(), ".hanako");
     fs.mkdirSync(path.join(home), { recursive: true });
     fs.writeFileSync(path.join(home, "users.json"), JSON.stringify({ displayName: "小测试" }));
-    // 预置：设置里选 hana 档 + 指定 deepseek（模拟用户把做册模型指到非 MiniMax 渠道）
+    fs.writeFileSync(path.join(home, "models.json"), JSON.stringify({ providers: {
+      "command code": { baseUrl: "https://api.commandcode.ai/provider/v1", api: "openai-completions", models: [{ id: "deepseek/deepseek-v4-flash", input: ["text"], reasoning: true }] },
+    } }));
     await new UserData(path.join(home, "plugin-data", "shiguangji")).updateSettings({
       modelSource: "hana",
-      hanaModel: { providerId: "deepseek", modelId: "deepseek-v4-flash" },
+      hanaModel: { providerId: "command code", modelId: "deepseek/deepseek-v4-flash" },
     });
     const root = path.join(home, "agents");
     fs.mkdirSync(path.join(root, "hanako", "sessions"), { recursive: true });
     fs.writeFileSync(path.join(root, "hanako", "config.yaml"), "agent:\\n  name: 小花\\n");
-    fs.writeFileSync(path.join(root, "hanako", "sessions", "one.jsonl"), JSON.stringify({ type: "message", timestamp: "2026-08-29T10:00:00", message: { role: "user", content: "一起整理日历" } }) + "\\n");
+    fs.writeFileSync(path.join(root, "hanako", "sessions", "one.jsonl"), Array.from({ length: 180 }, (_, index) => JSON.stringify({
+      type: "message",
+      timestamp: "2026-08-29T10:" + String(Math.floor(index / 3)).padStart(2, "0") + ":" + String(index % 60).padStart(2, "0"),
+      message: { role: index % 2 ? "assistant" : "user", content: (index % 2 ? "小花回复" : "一起整理日历") + " " + index + " " + "x".repeat(480) },
+    })).join("\\n") + "\\n");
     const routes = [];
     const app = {
       get(p, h) { routes.push({ method: "GET", path: p, handler: h }); },
@@ -466,30 +507,166 @@ test("路由：hana 档指定做册模型时，总结调用不带 agentId（防�
       put(p, h) { routes.push({ method: "PUT", path: p, handler: h }); },
       delete(p, h) { routes.push({ method: "DELETE", path: p, handler: h }); },
     };
-    const calls = [];
+    const busCalls = [];
+    const networkCalls = [];
+    let requestCount = 0;
+    let contextErrorNext = false;
+    let contextErrorRemaining = 0;
     registerRoutes(app, {
-      bus: { async request(topic, input) { calls.push({ topic, input }); return { text: "摘要：正常生成" }; } },
+      bus: { async request(topic, input) {
+        busCalls.push({ topic, input });
+        if (topic === "provider:credentials") return { apiKey: "runtime-key", baseUrl: "https://api.commandcode.ai/provider/v1", api: "openai-completions" };
+        throw new Error("不应请求工具模型总线");
+      } },
+      network: {
+        async fetch(url, init) {
+          requestCount += 1;
+          networkCalls.push({ url, body: JSON.parse(init.body) });
+          if (contextErrorRemaining > 0) {
+            contextErrorRemaining -= 1;
+            throw new Error("HTTP 413 Payload Too Large");
+          }
+          if (contextErrorNext) {
+            contextErrorNext = false;
+            throw new Error("HTTP 413 Payload Too Large");
+          }
+          const content = requestCount <= 2 ? "" : "摘要：正常生成";
+          return { ok: true, status: 200, async text() { return JSON.stringify({ choices: [{ message: { content } }] }); } };
+        },
+      },
       log: { info() {}, warn() {}, error() {} },
     });
     const run = routes.find((item) => item.method === "POST" && item.path === "/api/summaries/run");
     const result = await run.handler({ req: { async json() { return { date: "2026-08-29" }; } }, json(value) { return value; } });
     if (!result.ok) throw new Error("做册失败：" + JSON.stringify(result));
-    const call = calls.find((c) => c.input?.callPurpose === "summary");
-    if (!call) throw new Error("没有发出总结调用");
-    // 铁律：hana 档显式指定了 provider/model，绝不能带 agentId（否则宿主按助手模型路由，指定模型被忽略）
-    if (call.input.agentId) throw new Error("hana 档仍带了 agentId：" + JSON.stringify(call.input));
-    if (call.input.providerId !== "deepseek" || call.input.modelId !== "deepseek-v4-flash") {
-      throw new Error("hana 档没有使用指定模型：" + JSON.stringify(call.input));
+    const utilityCalls = busCalls.filter((item) => item.topic === "utility:call-text");
+    if (utilityCalls.length) throw new Error("hana 档仍请求了工具模型总线：" + JSON.stringify(utilityCalls));
+    const call = networkCalls.find((item) => item.body?.model === "deepseek/deepseek-v4-flash");
+    if (!call) throw new Error("没有直连所选模型：" + JSON.stringify(networkCalls));
+    if (networkCalls.length !== 3) throw new Error("空正文后没有按预期缩短提示重试：" + networkCalls.length);
+    const firstPromptLength = networkCalls[0].body.messages[0].content.length;
+    const fallbackPromptLength = networkCalls[2].body.messages[0].content.length;
+    if (firstPromptLength > 10000 || fallbackPromptLength >= firstPromptLength || fallbackPromptLength > 6000) {
+      throw new Error("总结提示没有按预算压缩：" + JSON.stringify({ firstPromptLength, fallbackPromptLength }));
     }
-    console.log(JSON.stringify({ providerId: call.input.providerId, modelId: call.input.modelId, agentId: call.input.agentId || null }));
+    contextErrorNext = true;
+    const contextErrorResult = await run.handler({ req: { async json() { return { date: "2026-08-29" }; } }, json(value) { return value; } });
+    if (!contextErrorResult.ok || networkCalls.length !== 5) {
+      throw new Error("上下文超限没有走紧凑重试：" + JSON.stringify({ contextErrorResult, requests: networkCalls.length }));
+    }
+    contextErrorRemaining = 2;
+    const exhaustedFallbackResult = await run.handler({ req: { async json() { return { date: "2026-08-29" }; } }, json(value) { return value; } });
+    if (exhaustedFallbackResult.ok || networkCalls.length !== 7) {
+      throw new Error("紧凑窗口失败后仍继续放大/重试：" + JSON.stringify({ exhaustedFallbackResult, requests: networkCalls.length }));
+    }
+    console.log(JSON.stringify({ url: call.url, model: call.body.model, utilityCalls: utilityCalls.length, requests: networkCalls.length, firstPromptLength, fallbackPromptLength }));
   `;
   const result = spawnSync(process.execPath, ["--input-type=module", "-e", childCode], {
     encoding: "utf8",
     env: { ...process.env, USERPROFILE: isolatedHome, HOME: isolatedHome, HANA_HOME: path.join(isolatedHome, ".hanako") },
   });
   assert.equal(result.status, 0, result.stderr || result.stdout);
-  assert.match(result.stdout, /"providerId":"deepseek"/);
-  assert.match(result.stdout, /"agentId":null/);
+  assert.match(result.stdout, /api\.commandcode\.ai\/provider\/v1\/chat\/completions/);
+  assert.match(result.stdout, /"model":"deepseek\/deepseek-v4-flash"/);
+  assert.match(result.stdout, /"utilityCalls":0/);
+  assert.match(result.stdout, /"requests":7/);
+});
+
+test("模型失败诊断：只给跟随档的工具通道错误追加自救路径", () => {
+  const hinted = modelChannelErrorHint("模型未回复正文，请稍后重试", "agent");
+  assert.match(hinted, /工具模型通道/);
+  assert.match(hinted, /设置 → 模型/);
+  assert.match(hinted, /从 Hana 模型列表选择/);
+  assert.equal(modelChannelErrorHint("模型未回复正文", "hana"), "模型未回复正文");
+  assert.equal(modelChannelErrorHint("HTTP 401", "agent"), "HTTP 401");
+  assert.match(modelChannelErrorHint("HTTP 413 Payload Too Large", "agent"), /工具模型通道/);
+  assert.match(modelChannelErrorHint("input too long for context window", "agent"), /工具模型通道/);
+});
+
+test("总结错误：只把上下文过大/请求体过大归入紧凑重试", () => {
+  assert.equal(isSummaryPromptSizeError("HTTP 413 Payload Too Large"), true);
+  assert.equal(isSummaryPromptSizeError("context length exceeded"), true);
+  assert.equal(isSummaryPromptSizeError({ code: "context_length_exceeded" }), true);
+  assert.equal(isSummaryPromptSizeError("HTTP 401 Authentication Fails, Your api key: ****.svg is invalid"), false);
+  assert.equal(isSummaryPromptSizeError("ByteString conversion failed: character at index 7 has a value of 9888 which is greater than 255"), false);
+  assert.equal(isSummaryPromptSizeError("这个 Hana 模型还没完成直连配置，请补一次 API Key"), false);
+  assert.equal(isSummaryPromptSizeError("request timed out"), false);
+});
+
+test("路由：Hana 模型列表返回支持直连协议，凭据由运行时提供", () => {
+  const isolatedHome = fs.mkdtempSync(path.join(os.tmpdir(), "sgj-hana-model-list-test-"));
+  const routeUrl = pathToFileURL(path.resolve("routes/ui.js")).href;
+  const childCode = `
+    import fs from "node:fs";
+    import path from "node:path";
+    import os from "node:os";
+    import registerRoutes from ${JSON.stringify(routeUrl)};
+    const home = path.join(os.homedir(), ".hanako");
+    fs.mkdirSync(home, { recursive: true });
+    fs.writeFileSync(path.join(home, "models.json"), JSON.stringify({ providers: {
+      deepseek: { baseUrl: "https://api.deepseek.com", api: "openai-responses", apiKey: "hana-runtime-api-key:deepseek", models: [{ id: "deepseek-v4", name: "DeepSeek V4", input: ["text"] }] },
+      runtimeOnly: { baseUrl: "https://runtime-only.test/v1", api: "openai-responses", models: [{ id: "runtime-model", input: ["text"] }] },
+      "xai-oauth": { baseUrl: "https://cli-chat-proxy.grok.com/v1", api: "openai-responses", models: [{ id: "grok-4.5", input: ["text"], headers: { "x-grok-model-override": "grok-4.5" } }] },
+      gemini: { baseUrl: "https://generativelanguage.googleapis.com/v1beta", api: "google-generative-ai", apiKey: "hana-runtime-api-key:gemini", models: [{ id: "gemini-pro", input: ["text"] }] },
+    } }));
+    const routes = [];
+    const app = {
+      get(p, h) { routes.push({ method: "GET", path: p, handler: h }); },
+      post() {}, put() {}, delete() {},
+    };
+    registerRoutes(app, { log: { info() {}, warn() {}, error() {} } });
+    const route = routes.find((item) => item.path === "/api/model-config/hana-models");
+    const result = await route.handler({ json(value) { return value; } });
+    console.log(JSON.stringify(result));
+  `;
+  const result = spawnSync(process.execPath, ["--input-type=module", "-e", childCode], {
+    encoding: "utf8",
+    env: { ...process.env, USERPROFILE: isolatedHome, HOME: isolatedHome, HANA_HOME: path.join(isolatedHome, ".hanako") },
+  });
+  assert.equal(result.status, 0, result.stderr || result.stdout);
+  const payload = JSON.parse(result.stdout.trim());
+  assert.equal(payload.models.length, 2);
+  assert.deepEqual(payload.models[0], {
+    providerId: "deepseek",
+    providerName: "deepseek",
+    baseUrl: "https://api.deepseek.com",
+    api: "openai-responses",
+    models: [{ modelId: "deepseek-v4", name: "DeepSeek V4", api: "openai-responses", reasoning: false }],
+  });
+  assert.deepEqual(payload.models[1], {
+    providerId: "runtimeOnly",
+    providerName: "runtimeOnly",
+    baseUrl: "https://runtime-only.test/v1",
+    api: "openai-responses",
+    models: [{ modelId: "runtime-model", name: "runtime-model", api: "openai-responses", reasoning: false }],
+  });
+  assert.doesNotMatch(result.stdout, /xai-oauth|grok-4\.5/);
+  assert.doesNotMatch(result.stdout, /hana-runtime-api-key/);
+});
+
+test("页面：三档模型区域与 Hana 运行时凭据直连文案保持一致", async () => {
+  const { renderPage } = await import("../lib/page-template.js");
+  const html = renderPage("test-token");
+  const asset = fs.readFileSync(path.resolve("assets/model-config-panel.js"), "utf8");
+  for (const source of [html, asset]) {
+    assert.match(source, /跟随伙伴/);
+    assert.match(source, /工具模型留空/);
+    assert.match(source, /从 Hana 模型列表选择/);
+    assert.match(source, /运行时凭据/);
+    assert.match(source, /自定义 API/);
+    assert.match(source, /API Key/);
+  }
+  assert.doesNotMatch(html, /id="mc-hana-key"/);
+  assert.doesNotMatch(asset, /id="mc-hana-key"/);
+  assert.doesNotMatch(html, /Hana 模型设置页/);
+  assert.doesNotMatch(asset, /Hana 模型设置页/);
+  assert.match(html, /id="mc-custom-key-toggle"/);
+  assert.match(html, /function mcToggleKey/);
+  assert.match(asset, /id="mc-custom-key-toggle"/);
+  assert.match(asset, /function toggleKeyVisibility/);
+  assert.match(html, /providerId: document\.getElementById\('mc-provider'\)\.value/);
+  assert.doesNotMatch(html, /baseUrl: provider \? provider\.baseUrl/);
+  assert.doesNotMatch(html, /api: provider \? provider\.api/);
 });
 
 test("路由：后台总结任务异步完成、持久化并清洗用户称呼", () => {

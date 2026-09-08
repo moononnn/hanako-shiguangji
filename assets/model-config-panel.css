@@ -119,6 +119,15 @@
   outline: none;
   border-color: var(--mc-accent, #c9a87c);
 }
+.mc-key-control { display: flex; align-items: center; gap: 8px; }
+.mc-key-control input { flex: 1; min-width: 0; }
+.mc-key-toggle {
+  flex: none; border: 1px solid var(--mc-border, #e2d6c4);
+  border-radius: 8px; background: var(--mc-input-bg, #fff);
+  color: var(--mc-text-light, #a08d74); padding: 6px 10px;
+  font: inherit; font-size: 12px; cursor: pointer;
+}
+.mc-key-toggle:hover { border-color: var(--mc-accent, #c9a87c); color: var(--mc-accent, #c9a87c); }
 .mc-hint { margin: 0; font-size: 11px; color: var(--mc-text-light, #a08d74); line-height: 1.6; }
 .mc-link-btn {
   align-self: flex-start;

@@ -2,7 +2,7 @@
   "manifestVersion": 1,
   "id": "shiguangji",
   "name": "拾光记",
-  "version": "0.2.87",
+  "version": "0.2.94",
   "description": "日子账本：情境注入引擎 + 日历 + 节假日/纪念日/待办 + 每日做册。让每个助手都知道今天是什么日子。",
   "trust": "full-access",
   "minAppVersion": "0.421.0",
@@ -18,7 +18,26 @@
   ],
   "network": {
     "allowedHosts": [
-      "*"
+      "api.open-meteo.com",
+      "geocoding-api.open-meteo.com",
+      "api.github.com",
+      "api.openai.com",
+      "api.anthropic.com",
+      "api.deepseek.com",
+      "openrouter.ai",
+      "api.moonshot.cn",
+      "open.bigmodel.cn",
+      "dashscope.aliyuncs.com",
+      "ark.cn-beijing.volces.com",
+      "api.siliconflow.cn",
+      "api.z.ai",
+      "api.minimax.chat",
+      "api.minimaxi.com",
+      "api.x.ai",
+      "api.groq.com",
+      "api.mistral.ai",
+      "api.commandcode.ai",
+      "note3-prev-api.askdiandian.com"
     ],
     "methods": [
       "POST",

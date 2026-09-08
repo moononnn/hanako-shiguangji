@@ -14,14 +14,14 @@
 //   GET  {apiBase}              → { ok, config }（config 已脱敏）
 //   POST {apiBase}              → body: patch → { ok, config }
 //   POST {apiBase}/test         → body: { source } → { ok, note } | { ok: false, error }
-//   GET  {apiBase}/hana-models  → { ok, models: [{ providerId, modelId, label }] }
+//   GET  {apiBase}/hana-models  → { ok, models: [{ providerId, providerName, baseUrl, api, models: [{ modelId, name }] }] }
 
 (function (global) {
   'use strict';
 
   var SOURCES = [
-    { id: 'agent',  name: '跟随助手当前模型', desc: '用的就是对话里的模型，不用额外配置' },
-    { id: 'hana',   name: '从 Hana 模型列表里选', desc: '自动拉取 Hana 已配置的模型' },
+    { id: 'agent',  name: '跟随伙伴', desc: '使用 Hana 工具模型；工具模型留空时回落伙伴主对话模型' },
+    { id: 'hana',   name: '从 Hana 模型列表选择', desc: '自动拉取已配置模型，按 Hana 凭据直连所选模型' },
     { id: 'custom', name: '自定义 API', desc: '地址、Key、模型名自己填，适合有自己渠道的用户' },
   ];
 
@@ -54,7 +54,7 @@
       +       '<div class="mc-current" id="mc-current">当前使用：加载中…</div>'
       +       '<div class="mc-source-list">' + radioHtml + '</div>'
       +       '<div class="mc-form" id="mc-form-agent">'
-      +         '<p class="mc-hint">当前使用对话里的模型，不需要额外配置。如果插件功能异常，再试试下面的选项。</p>'
+      +         '<p class="mc-hint">使用 Hana 的工具模型；工具模型留空时，才会回落到当前伙伴的主对话模型。</p>'
       +       '</div>'
       +       '<div class="mc-form" id="mc-form-hana" hidden>'
       +         '<label class="mc-field">供应商'
@@ -63,14 +63,18 @@
       +         '<label class="mc-field">模型'
       +           '<select id="mc-model"><option value="">请选择</option></select>'
       +         '</label>'
-      +         '<p class="mc-hint">从 Hana 已配置的模型里选，密钥不会交给插件。</p>'
+      +         '<p class="mc-hint">从 Hana 已配置的模型里选择。插件会读取该供应商的运行时凭据并直连所选模型，不需要另填 Key。列表里没有的供应商，可改用“自定义 API”。</p>'
+      +         '<p class="mc-hint" id="mc-hana-import-detail">选好模型后会显示当前选择。</p>'
       +       '</div>'
       +       '<div class="mc-form" id="mc-form-custom" hidden>'
       +         '<label class="mc-field">API 地址'
       +           '<input type="text" id="mc-custom-url" placeholder="https://api.example.com/v1">'
       +         '</label>'
       +         '<label class="mc-field">API Key'
-      +           '<input type="password" id="mc-custom-key" placeholder="留空表示不修改">'
+      +           '<div class="mc-key-control">'
+      +             '<input type="password" id="mc-custom-key" placeholder="留空表示不修改" autocomplete="off" spellcheck="false">'
+      +             '<button type="button" class="mc-key-toggle" id="mc-custom-key-toggle" aria-controls="mc-custom-key" aria-pressed="false">显示</button>'
+      +           '</div>'
       +         '</label>'
       +         '<label class="mc-field">模型名'
       +           '<input type="text" id="mc-custom-model" placeholder="如 gpt-4o-mini">'
@@ -82,6 +86,7 @@
       +             '<option value="anthropic-messages">Anthropic 格式</option>'
       +           '</select>'
       +         '</label>'
+      +         '<p class="mc-hint">已预置 OpenAI / Anthropic / DeepSeek / Kimi / 智谱 / MiniMax / 火山 / 百炼 / 硅基流动等常见服务域名；名单外的域名可在插件 manifest.json 的 network.allowedHosts 里添加后重启 HanaAgent 生效。</p>'
       +         '<p class="mc-hint" id="mc-custom-key-hint"></p>'
       +         '<button type="button" class="mc-link-btn" id="mc-clear-key-btn" hidden>清除已存 Key</button>'
       +       '</div>'
@@ -143,6 +148,7 @@
 
     function setSource(source) {
       state.source = source;
+      resetKeyVisibility();
       var radios = document.querySelectorAll('input[name="mc-source"]');
       for (var i = 0; i < radios.length; i++) radios[i].checked = (radios[i].value === source);
       var optsList = document.querySelectorAll('.mc-source-option');
@@ -155,6 +161,28 @@
       document.getElementById('mc-test-result').textContent = '';
     }
 
+    function resetKeyVisibility() {
+      ['mc-custom-key'].forEach(function (id) {
+        var input = document.getElementById(id);
+        var button = document.getElementById(id + '-toggle');
+        if (input) input.type = 'password';
+        if (button) {
+          button.textContent = '显示';
+          button.setAttribute('aria-pressed', 'false');
+        }
+      });
+    }
+
+    function toggleKeyVisibility(inputId, buttonId) {
+      var input = document.getElementById(inputId);
+      var button = document.getElementById(buttonId);
+      if (!input || !button) return;
+      var visible = input.type === 'password';
+      input.type = visible ? 'text' : 'password';
+      button.textContent = visible ? '隐藏' : '显示';
+      button.setAttribute('aria-pressed', String(visible));
+    }
+
     function renderConfig(cfg) {
       state.config = cfg;
       pendingHanaEcho = null; // 先清残留：本次不是 hana 档就不会带回显旧值
@@ -162,16 +190,16 @@
       // 当前使用状态行（重启后也能一眼看出选的是哪档）
       var curEl = document.getElementById('mc-current');
       if (curEl) {
-        var label = '跟随助手当前模型';
+        var label = '跟随伙伴';
         if (cfg.source === 'hana') {
-          label = 'Hana · ' + (cfg.hanaModel && cfg.hanaModel.providerId ? cfg.hanaModel.providerId : '?');
+          label = 'Hana · ' + (cfg.hanaModel && cfg.hanaModel.providerId ? cfg.hanaModel.providerId : '未选');
           if (cfg.hanaModel && cfg.hanaModel.modelId) label += ' / ' + cfg.hanaModel.modelId;
         } else if (cfg.source === 'custom') {
           label = '自定义 API · ' + ((cfg.customModel && cfg.customModel.model) || '未填写模型');
         }
         curEl.textContent = '当前使用：' + label;
       }
-      // hana 档：回显已选 provider/model（模型列表可能还没到，暂存待列表到齐后重放）
+      // hana 档：只回显已选 provider/model，凭据不进入页面。
       if (cfg.hanaModel && cfg.hanaModel.providerId) {
         pendingHanaEcho = { providerId: cfg.hanaModel.providerId, modelId: cfg.hanaModel.modelId };
         var sel = document.getElementById('mc-provider');
@@ -205,28 +233,39 @@
     function fillProviders() {
       var sel = document.getElementById('mc-provider');
       var cur = sel.value;
-      var providers = [];
-      var seen = {};
-      state.hanaModels.forEach(function (m) {
-        var pid = m.providerId || m.provider || '';
-        if (pid && !seen[pid]) { seen[pid] = true; providers.push(pid); }
-      });
-      sel.innerHTML = '<option value="">请选择</option>' + providers.map(function (p) {
-        return '<option value="' + esc(p) + '">' + esc(p) + '</option>';
+      sel.innerHTML = '<option value="">请选择</option>' + state.hanaModels.map(function (p) {
+        var pid = p.providerId || p.provider || '';
+        return '<option value="' + esc(pid) + '">' + esc(p.providerName || pid) + '</option>';
       }).join('');
       if (cur) sel.value = cur;
     }
 
+    function selectedHanaProvider() {
+      var providerId = document.getElementById('mc-provider').value;
+      return state.hanaModels.find(function (p) {
+        return (p.providerId || p.provider) === providerId;
+      }) || null;
+    }
+
+    function updateHanaImportDetail() {
+      var detail = document.getElementById('mc-hana-import-detail');
+      var provider = selectedHanaProvider();
+      var modelId = document.getElementById('mc-model').value;
+      if (detail) detail.textContent = provider && modelId
+        ? '已选择“' + (provider.providerName || provider.providerId) + '”的模型“' + modelId + '”，测试或保存后会按 Hana 运行时配置直连。'
+        : '选好模型后会显示当前选择。';
+    }
+
     function fillModels(providerId, selectedModel) {
       var sel = document.getElementById('mc-model');
-      var list = state.hanaModels.filter(function (m) {
-        return (m.providerId || m.provider) === providerId;
-      });
+      var provider = selectedHanaProvider();
+      var list = provider && Array.isArray(provider.models) ? provider.models : [];
       sel.innerHTML = '<option value="">请选择</option>' + list.map(function (m) {
-        var mid = m.modelId || m.model || '';
-        return '<option value="' + esc(mid) + '">' + esc(m.label || mid) + '</option>';
+        var mid = m.modelId || m.model || m.id || '';
+        return '<option value="' + esc(mid) + '">' + esc(m.label || m.name || mid) + '</option>';
       }).join('');
       if (selectedModel) sel.value = selectedModel;
+      updateHanaImportDetail();
     }
 
     async function loadConfig() {
@@ -331,7 +370,7 @@
     }
 
     function saveWithClearKey() {
-      // 明确清除已存 Key（与留空不覆盖区分）
+      // 明确清除自定义 API 的 Key（与留空不覆盖区分）
       var patch = collectPatch();
       if (!patch.customModel) patch.customModel = {};
       patch.customModel.clearApiKey = true;
@@ -365,6 +404,7 @@
       if (t.closest && t.closest('[data-mc-close]')) { close(); return; }
       if (t.id === 'mc-save-btn') { save(); return; }
       if (t.id === 'mc-test-btn') { test(); return; }
+      if (t.id === 'mc-custom-key-toggle') { toggleKeyVisibility('mc-custom-key', 'mc-custom-key-toggle'); return; }
       if (t.id === 'mc-clear-key-btn') {
         saveWithClearKey();
         return;
@@ -375,6 +415,7 @@
     document.getElementById('mc-provider').addEventListener('change', function () {
       fillModels(this.value, '');
     });
+    document.getElementById('mc-model').addEventListener('change', updateHanaImportDetail);
     document.getElementById('mc-open-btn').addEventListener('click', open);
   }
 
