@@ -12,7 +12,7 @@ import { __setSharedUserDataForTest } from "../lib/shared-data.js";
 // 用临时数据目录隔离测试数据；扩展注册时的天气检查也不会触碰真实配置。
 const TEST_DATA_DIR = path.join(os.tmpdir(), `sgj-ext-test-${Date.now()}`);
 
-import registerShiguangjiInject, { __resetLazySummaryForTest, resolveAgentId, resolveCurrentModel } from "../extensions/inject.js";
+import registerShiguangjiInject, { __resetLazySummaryForTest, __setInjectNowForTest, __clearInjectTrackersForTest, resolveAgentId, resolveCurrentModel } from "../extensions/inject.js";
 
 before(() => {
   fs.mkdirSync(TEST_DATA_DIR, { recursive: true });
@@ -190,22 +190,117 @@ test("扩展：注入失败不抛错（数据目录不可写也安全）", async
   assert.equal(threw, false, "不应抛错");
 });
 
-test("扩展：DeepSeek 首次识别硬触发，同一时段不重复", () => {
+test("扩展：DeepSeek 换班窗口前首次识别硬触发，同一时段不重复", () => {
   const data = new UserData(path.join(os.tmpdir(), `sgj-deepseek-ext-${Date.now()}-${Math.random().toString(36).slice(2)}`));
   __setSharedUserDataForTest(data);
-  const pi = makePi();
-  registerShiguangjiInject(pi);
-  const ctx = {
-    model: { provider: "openrouter", id: "deepseek/deepseek-v4-flash" },
-    sessionManager: { getSessionId: () => "deepseek-session" },
-  };
-  const first = pi._handlers["before_agent_start"]({}, ctx);
-  assert.ok(first?.message, "首次识别 DeepSeek 必须带关照");
-  assert.ok(first.message.content.includes("DeepSeek 系模型"), first.message.content);
-  assert.equal(first.message.details.deepseekNotice, true);
-  const second = pi._handlers["before_agent_start"]({}, ctx);
-  assert.equal(second, undefined, "同一聊天框同一时段不应每轮重复");
-  __setSharedUserDataForTest(new UserData(TEST_DATA_DIR));
+  __setInjectNowForTest(() => new Date("2026-09-07T11:57:00+08:00")); // 周一 11:57：在 12:00 谷时边界前 5 分钟窗口内
+  try {
+    const pi = makePi();
+    registerShiguangjiInject(pi);
+    const ctx = {
+      model: { provider: "openrouter", id: "deepseek/deepseek-v4-flash" },
+      sessionManager: { getSessionId: () => "deepseek-preview-session" },
+    };
+    const first = pi._handlers["before_agent_start"]({}, ctx);
+    assert.ok(first?.message, "撞进换班窗口的首次识别必须带关照");
+    assert.ok(first.message.content.includes("DeepSeek 系模型"), first.message.content);
+    assert.equal(first.message.details.deepseekNotice, true);
+    const second = pi._handlers["before_agent_start"]({}, ctx);
+    assert.equal(second, undefined, "同一聊天框同一时段不应每轮重复");
+  } finally {
+    __setInjectNowForTest(null);
+    __setSharedUserDataForTest(new UserData(TEST_DATA_DIR));
+  }
+});
+
+test("扩展：DeepSeek 工作日新窗口首次检测报当前时段，同窗口不重复", () => {
+  const data = new UserData(path.join(os.tmpdir(), `sgj-deepseek-open-${Date.now()}-${Math.random().toString(36).slice(2)}`));
+  __setSharedUserDataForTest(data);
+  __setInjectNowForTest(() => new Date("2026-09-07T09:30:00+08:00")); // 周一 9:30：高峰中段，非换班窗口
+  try {
+    const pi = makePi();
+    registerShiguangjiInject(pi);
+    const ctx = {
+      model: { provider: "openrouter", id: "deepseek/deepseek-v4-flash" },
+      sessionManager: { getSessionId: () => "deepseek-opening-session" },
+    };
+    const first = pi._handlers["before_agent_start"]({}, ctx);
+    assert.ok(first?.message, "新窗口开场要带当前时段关照");
+    assert.equal(first.message.details.deepseekNotice, true, "新窗口首次检测播报当前时段");
+    assert.ok(first.message.content.includes("模型峰谷关照"), first.message.content);
+    const second = pi._handlers["before_agent_start"]({}, ctx);
+    assert.equal(second, undefined, "同一窗口同一时段不重复");
+  } finally {
+    __setInjectNowForTest(null);
+    __setSharedUserDataForTest(new UserData(TEST_DATA_DIR));
+  }
+});
+
+test("扩展：DeepSeek 周末新聊天框开场给一次全天谷关照，不重复", () => {
+  const data = new UserData(path.join(os.tmpdir(), `sgj-deepseek-weekend-${Date.now()}-${Math.random().toString(36).slice(2)}`));
+  __setSharedUserDataForTest(data);
+  __setInjectNowForTest(() => new Date("2026-09-05T10:00:00+08:00")); // 周六 10:00：全天谷时
+  try {
+    const pi = makePi();
+    registerShiguangjiInject(pi);
+    const ctx = {
+      model: { provider: "openrouter", id: "deepseek/deepseek-v4-flash" },
+      sessionManager: { getSessionId: () => "deepseek-weekend-session" },
+    };
+    const first = pi._handlers["before_agent_start"]({}, ctx);
+    assert.ok(first?.message, "周末开场必须带一次全天谷关照");
+    assert.equal(first.message.details.deepseekNotice, true);
+    assert.ok(first.message.content.includes("模型峰谷关照"), first.message.content);
+    const second = pi._handlers["before_agent_start"]({}, ctx);
+    assert.equal(second, undefined, "同一聊天框周末关照只出现一次");
+  } finally {
+    __setInjectNowForTest(null);
+    __setSharedUserDataForTest(new UserData(TEST_DATA_DIR));
+  }
+});
+
+test("扩展：重启后同一旧窗口不重复播报，真新窗口照常开场", async () => {
+  const dir = path.join(os.tmpdir(), `sgj-deepseek-restart-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+  const data1 = new UserData(dir);
+  __setSharedUserDataForTest(data1);
+  __setInjectNowForTest(() => new Date("2026-09-07T09:30:00+08:00")); // 周一 9:30：非换班窗口
+  try {
+    const ctxA = {
+      model: { provider: "openrouter", id: "deepseek/deepseek-v4-flash" },
+      sessionManager: { getSessionId: () => "sess-restart-A" },
+    };
+    const pi1 = makePi();
+    registerShiguangjiInject(pi1);
+    const first = pi1._handlers["before_agent_start"]({}, ctxA);
+    assert.equal(first.message.details.deepseekNotice, true, "重启前：新窗口开场带当前时段");
+
+    // 等峰谷状态落盘完成（EncryptedStore 写队列串行：追加一个空 update 排到队尾）
+    await data1.deepseekPeak.update(() => {});
+
+    // 模拟进程重启：清空内存 tracker，盘上 deepseekPeak store 保留；同一数据目录重建实例 = 重新读盘
+    __clearInjectTrackersForTest();
+    const data2 = new UserData(dir);
+    __setSharedUserDataForTest(data2);
+    const pi2 = makePi();
+    registerShiguangjiInject(pi2);
+
+    const second = pi2._handlers["before_agent_start"]({}, ctxA);
+    if (second?.message) {
+      assert.equal(second.message.details.deepseekNotice, false, "重启后旧窗口不再当新窗口重复播报");
+      assert.ok(!second.message.content.includes("模型峰谷关照"), second.message.content);
+    }
+
+    // 真新窗口：开场仍照常播报当前时段
+    const ctxB = {
+      model: { provider: "openrouter", id: "deepseek/deepseek-v4-flash" },
+      sessionManager: { getSessionId: () => "sess-restart-B" },
+    };
+    const fresh = pi2._handlers["before_agent_start"]({}, ctxB);
+    assert.equal(fresh.message.details.deepseekNotice, true, "真新窗口开场仍带当前时段");
+  } finally {
+    __setInjectNowForTest(null);
+    __setSharedUserDataForTest(new UserData(TEST_DATA_DIR));
+  }
 });
 
 test("扩展：新会话返回注入消息结构（display:false）", () => {

@@ -1,4 +1,4 @@
-﻿// 拾光记 · 核心测试
+// 拾光记 · 核心测试
 // 覆盖：加密存储、注入判定、节假日、数据层（事件/生理期/待办）
 //
 // 生活日边界（凌晨翻篇）按用户本机日期语义工作。测试用固定 +08:00 时刻表达
@@ -309,8 +309,16 @@ test("DeepSeek：首次识别、提前预告和错过预告后的补报只各触
     now: new Date("2026-09-05T10:00:00+08:00"),
   });
   assert.equal(weekendOpening.should, true);
+  assert.equal(weekendOpening.notice.kind, "detected", "周末新窗口开场也走 detected，文案层按周末谷时选词");
   assert.equal(weekendOpening.notice.isWeekend, true);
   assert.equal(weekendOpening.notice.period, "valley");
+
+  const weekendSecond = decideDeepSeekNotice({
+    model,
+    now: new Date("2026-09-05T14:30:00+08:00"),
+    lastState: weekendOpening.state,
+  });
+  assert.equal(weekendSecond.should, false, "同一聊天框周末只开场关照一次，不重复");
 
   const morningPreview = decideDeepSeekNotice({
     model,
@@ -348,6 +356,46 @@ test("DeepSeek：首次识别、提前预告和错过预告后的补报只各触
   assert.equal(afterOvernightGap.should, true, "隔夜仍要补报已错过的18点边界");
   assert.equal(afterOvernightGap.notice.kind, "entered");
   assert.equal(afterOvernightGap.notice.period, "valley");
+});
+
+test("DeepSeek：新窗口首次检测报当前时段，重启恢复后同一窗口不重复播报", () => {
+  const model = { provider: "openrouter", id: "deepseek/deepseek-v4-flash" };
+  // 真新窗口（无 lastState）：工作日非换班窗口也开口报当前时段，让用户心里有数
+  const opening = decideDeepSeekNotice({
+    model,
+    now: new Date("2026-09-07T09:30:00+08:00"), // 周一 9:30：高峰中段
+  });
+  assert.equal(opening.should, true, "新窗口开场要报当前时段");
+  assert.equal(opening.notice.kind, "detected");
+  assert.equal(opening.notice.period, "peak");
+  assert.equal(opening.state.dsActive, true);
+
+  // 同一窗口紧接着再聊（同时段）：不重复播报
+  const sameWindow = decideDeepSeekNotice({
+    model,
+    now: new Date("2026-09-07T09:31:00+08:00"),
+    lastState: opening.state,
+  });
+  assert.equal(sameWindow.should, false, "同一窗口同一时段不每轮重复");
+  assert.equal(sameWindow.reason, "same-period");
+
+  // 重启恢复（扩展层从盘上把 ds 状态装回 lastState）：旧窗口不再当新窗口报，临近换班窗口照常预告
+  const restored = decideDeepSeekNotice({
+    model,
+    now: new Date("2026-09-07T11:57:00+08:00"),
+    lastState: opening.state,
+  });
+  assert.equal(restored.should, true);
+  assert.equal(restored.notice.kind, "preview", "重启恢复后的旧窗口在换班窗口内仍正常预告");
+
+  // 静默期间错过边界，回来后补报
+  const crossedMissed = decideDeepSeekNotice({
+    model,
+    now: new Date("2026-09-07T12:30:00+08:00"),
+    lastState: opening.state,
+  });
+  assert.equal(crossedMissed.should, true);
+  assert.equal(crossedMissed.notice.kind, "entered");
 });
 
 // ── 注入文本 ──
@@ -518,6 +566,21 @@ test("总结提示：需要时按真实消息时间排序并保留生活日日�
   ], { agentName: "小花", includeTime: true });
   assert.ok(text.indexOf("[2026-09-05 16:14] 小花") < text.indexOf("[2026-09-06 00:30] 我"), text);
   assert.match(text, /\[2026-09-05 16:14\] 我：我有点焦虑/);
+});
+
+test("总结提示：字符预算保留首尾并覆盖全天时间", () => {
+  const rows = Array.from({ length: 40 }, (_, index) => ({
+    role: index % 2 ? "assistant" : "user",
+    ts: new Date(`2026-09-06T${String(4 + Math.floor(index / 4)).padStart(2, "0")}:00:00+08:00`).getTime(),
+    text: index === 0 ? "最早发生的事" : (index === 39 ? "最后发生的事" : `中间消息 ${index} ${"x".repeat(18)}`),
+  }));
+  const text = formatMessagesForPrompt(rows, { agentName: "小花", maxChars: 220 });
+  assert.ok(text.length <= 220, `超出字符预算：${text.length}`);
+  assert.match(text, /最早发生的事/);
+  assert.match(text, /最后发生的事/);
+  assert.ok(formatMessagesForPrompt(rows.slice(0, 2), { agentName: "小花", maxChars: 3 }).length <= 3);
+  assert.ok(formatMessagesForPrompt(rows.slice(0, 1), { agentName: "小花", maxChars: 2 }).length <= 2);
+  assert.equal(formatMessagesForPrompt([], { agentName: "小花", maxChars: 1 }), "");
 });
 
 test("生活日总结：按伙伴分组且近期默认不跨伙伴", async () => {

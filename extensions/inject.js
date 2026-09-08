@@ -21,11 +21,21 @@ import {
   weatherCacheIsFresh,
   weatherCacheMatches,
 } from "../lib/weather.js";
-import { configureDebugLog, logInfo } from "../lib/debug-log.js";
+import { configureDebugLog, logInfo, logWarn } from "../lib/debug-log.js";
 import { decideDeepSeekNotice } from "../lib/deepseek-peak.js";
 
 const tracker = new InjectionTracker();
 let weatherTimer = null; // 天气惰性刷新定时器
+let nowProvider = () => new Date(); // 可覆写的时钟（测试用），生产保持真实当前时间
+
+export function __setInjectNowForTest(provider) {
+  nowProvider = provider || (() => new Date());
+}
+
+// 模拟进程重启：清空内存 tracker，但盘上状态（deepseekPeak store）保留，供重启恢复类测试使用。
+export function __clearInjectTrackersForTest() {
+  tracker.sessions.clear();
+}
 
 export function __resetLazySummaryForTest() {
   // 兼容旧测试入口；总结已统一由路由层可靠定时器负责。
@@ -33,6 +43,12 @@ export function __resetLazySummaryForTest() {
 
 function contextDataDir(context) {
   return context?.dataDir || context?.pluginContext?.dataDir || context?.ctx?.dataDir || null;
+}
+
+// 峰谷判定状态异步落盘（fire-and-forget，复用 EncryptedStore 串行写队列，失败静默不影响对话）。
+function persistDeepSeekState(data, sessionId, dsState) {
+  if (!data || !sessionId || !dsState) return;
+  data.setDeepSeekPeakState(sessionId, dsState).catch(() => {});
 }
 
 function getData(context = null) {
@@ -60,9 +76,15 @@ export default function registerShiguangjiInject(pi) {
 
       const data = getData(ctx);
       const settings = data.getSettings();
-      const now = new Date();
+      const now = nowProvider();
       const injectionEnabled = settings.injectionEnabled !== false;
-      const lastState = tracker.get(sessionId);
+      let lastState = tracker.get(sessionId);
+      if (!lastState) {
+        // 重启后内存 tracker 已清空：从盘上恢复该会话的峰谷判定状态。
+        // 这样「重启后的旧窗口」仍记得上次的 dsActive/dsPreviewKeys，不会被误判成新窗口重复播报当前时段。
+        const diskDs = data.getDeepSeekPeakState(sessionId);
+        if (diskDs) lastState = { ...diskDs };
+      }
       const currentModel = resolveCurrentModel(event, ctx);
       const dataRev = data.getDataRev();
       const contextKey = JSON.stringify({
@@ -176,6 +198,7 @@ export default function registerShiguangjiInject(pi) {
       const deepseekForced = deepseekDecision.should;
       if (!decision.should && !deepseekForced) {
         tracker.set(sessionId, decisionState);
+        persistDeepSeekState(data, sessionId, deepseekDecision.state);
         return undefined;
       }
       if (deepseekForced) {
@@ -240,6 +263,7 @@ export default function registerShiguangjiInject(pi) {
 
       if (!text) {
         tracker.set(sessionId, decisionState);
+        persistDeepSeekState(data, sessionId, deepseekDecision.state);
         return undefined;
       }
 
@@ -262,6 +286,7 @@ export default function registerShiguangjiInject(pi) {
       }
 
       tracker.set(sessionId, { ...decisionState, lastHash: hash });
+      persistDeepSeekState(data, sessionId, deepseekDecision.state);
 
       return {
         message: {
@@ -358,6 +383,7 @@ function startWeatherRefresher() {
         coordinates: weatherConfig.coordinates,
         now: new Date(now),
         fetcher,
+        onError: (e) => logWarn(`天气后台刷新失败：${String(e?.message || e || "").slice(0, 300)}`),
       })
         .then((r) => {
           if (r) {
