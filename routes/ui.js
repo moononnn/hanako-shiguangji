@@ -58,6 +58,7 @@ import {
   segmentOfHour,
 } from "../lib/mood.js";
 import { readHanaUserName } from "../lib/user-name.js";
+import { findPartnerFortuneSignals, filterPartnerRows } from "../lib/partner-mood.js";
 import { moodLineSegmentForEntry, moodLineSegmentLabelForEntry } from "../lib/mood-line.js";
 import { TodoReminderScheduler } from "../lib/todo-reminder-scheduler.js";
 import { configureDebugLog, logInfo, logWarn, logError } from "../lib/debug-log.js";
@@ -695,6 +696,7 @@ export default function registerRoutes(app, ctx) {
         if (!["off", "economical", "detailed"].includes(mode)) return c.json({ ok: false, error: "自动情绪档位不对" });
         patch.moodDiscoveryMode = mode;
       }
+      if (body.partnerMoodEnabled !== undefined) patch.partnerMoodEnabled = !!body.partnerMoodEnabled;
       if (body.summaryAgentIds !== undefined) {
         if (body.summaryAgentIds !== null && !Array.isArray(body.summaryAgentIds)) {
           return c.json({ ok: false, error: "做册伙伴选择格式不对" });
@@ -1235,8 +1237,26 @@ async function runDailySummaryUnlocked(ctx, {
     }
   }
 
+  // 伙伴心情线：开关开启且自动情绪未关时，对做册选中伙伴（当天有对话者）整理际遇线。
+  // 独立于用户情绪链与做册总结，失败不影响两者；moodOnly 场景（已有总结/全不选）也一起跑。
+  let partnerMoodResults = null;
+  if (!preview && settings.partnerMoodEnabled && moodMode !== "off") {
+    try {
+      partnerMoodResults = await harvestPartnerMoodsForDay(ctx, { day, range, userName });
+      if (partnerMoodResults?.ok && !partnerMoodResults.skipped) {
+        const finished = (partnerMoodResults.results || []).filter((r) => r.ok && !r.skipped).length;
+        logInfo(`${day} 伙伴心情线整理完成：${finished} 位伙伴`);
+      }
+    } catch (e) {
+      // 伙伴心情线是附加能力，失败不能让日子档案跟着失败。
+      const error = modelChannelErrorHint(e, settings.modelSource || "agent");
+      logWarn(`${day} 伙伴心情线失败（不影响做册）：${error}`);
+      partnerMoodResults = { ok: false, error };
+    }
+  }
+
   if (moodOnly) {
-    return { ok: true, date: day, preview, moodOnly: true, mood: moodResult, text: "" };
+    return { ok: true, date: day, preview, moodOnly: true, mood: moodResult, partnerMood: partnerMoodResults, text: "" };
   }
 
   const allAgentIds = groups.map((group) => group.agentId);
@@ -1752,6 +1772,177 @@ async function harvestMoodForDay(ctx, { day, range, userName, messages = [], con
   };
 }
 
+/**
+ * 日终伙伴心情线：为做册选中的伙伴各整理一条「际遇锚点」的情绪线。
+ * 只读拾光记自身可见消息；候选证据必须能锚当天原文，不外推心理事实。
+ * 幂等：按 date|agentId 记录状态，重启不会重复调用；失败可随定时器在十分钟后重试。
+ */
+async function harvestPartnerMoodsForDay(ctx, { day, range, userName } = {}) {
+  const data = getData();
+  const settings = data.getSettings();
+  if (!settings.partnerMoodEnabled) return { ok: true, skipped: true, reason: "disabled" };
+  const moodMode = normalizeMoodDiscoveryMode(settings.moodDiscoveryMode);
+  if (moodMode === "off") return { ok: true, skipped: true, reason: "mood-disabled" };
+  if (!mcInstance) return { ok: false, error: "插件路由未初始化" };
+
+  // 伙伴链的证据靠际遇信号锚定，不能被做册的 per-agent 抽样稀释：重收全量，宁可多不可漏。
+  const collected = collectDayMessages({
+    agentsDir: AGENTS_DIR,
+    targetDate: day,
+    boundaryHour: settings.dayBoundaryHour ?? 4,
+    maxMessages: 20000,
+    maxMessagesPerAgent: 0,
+  });
+  const rows = Array.isArray(collected.messages) ? collected.messages : [];
+  const fullRange = collected.range && collected.range.start ? collected.range : range;
+  const selected = getSelectedSummaryAgentIds(settings);
+  const agentIdSet = new Set();
+  if (selected && selected.size > 0) {
+    for (const id of selected) {
+      const trimmed = String(id || "").trim();
+      if (trimmed) agentIdSet.add(trimmed);
+    }
+  } else if (selected === null) {
+    // null=全部伙伴：只处理当天确实有可见消息的伙伴，不给空白日硬造线。
+    for (const row of rows) {
+      const id = String(row.agentId || "").trim();
+      if (id) agentIdSet.add(id);
+    }
+  }
+  if (!agentIdSet.size) return { ok: true, skipped: true, reason: "no-selected" };
+
+  const results = [];
+  for (const agentId of agentIdSet) {
+    const previous = data.getPartnerMoodHarvestState(day, agentId);
+    if (isMoodHarvestTerminal(previous)) {
+      results.push({ agentId, ok: true, skipped: true, reason: "already-handled" });
+      continue;
+    }
+    try {
+      results.push(await harvestPartnerMoodForAgent(ctx, {
+        day,
+        range: fullRange,
+        userName,
+        rows,
+        agentId,
+        moodMode,
+        whitelist: MOODS.map((m) => m.label).join("/"),
+      }));
+    } catch (e) {
+      const error = modelChannelErrorHint(e, settings.modelSource || "agent");
+      logWarn(`${day} 伙伴心情线 ${agentId} 失败（不影响做册）：${error}`);
+      results.push({ agentId, ok: false, error: String(error).slice(0, 300) });
+    }
+  }
+  return { ok: true, results };
+}
+
+async function harvestPartnerMoodForAgent(ctx, { day, range, userName, rows, agentId, moodMode, whitelist }) {
+  const data = getData();
+  const partnerRows = filterPartnerRows(rows, agentId);
+  const saveState = async (patch) => {
+    try {
+      return await data.updatePartnerMoodHarvestState(day, agentId, patch);
+    } catch (e) {
+      logWarn(`${day} 伙伴心情线状态保存失败：${e?.message || e}`);
+      return null;
+    }
+  };
+  // 没有可见消息就没有证据，不为了一张空白情绪线调用模型。
+  if (!partnerRows.length) {
+    await saveState({ status: "skipped", reason: "no-visible-message", checkedAt: new Date().toISOString() });
+    return { ok: true, skipped: true, reason: "no-visible-message", agentId };
+  }
+  const signals = findPartnerFortuneSignals(rows, agentId);
+  // 轻量档只把命中际遇线索的生活日交给模型；细致档没线索也谨慎看上下文。
+  if (moodMode === "economical" && !signals.length) {
+    await saveState({
+      status: "skipped",
+      moodMode,
+      reason: "no-fortune-signal",
+      checkedAt: new Date().toISOString(),
+      messageCount: partnerRows.length,
+    });
+    return { ok: true, skipped: true, reason: "no-fortune-signal", agentId };
+  }
+  const agentName = readAgentDisplayName(AGENTS_DIR, agentId) || agentId;
+  const attemptedAt = new Date().toISOString();
+  await saveState({
+    status: "running",
+    moodMode,
+    attemptedAt,
+    messageCount: partnerRows.length,
+    explicitSignalCount: signals.length,
+  });
+  const fmtRow = (row) => {
+    const ts = new Date(Number(row.ts));
+    const stamp = !Number.isNaN(ts.getTime())
+      ? `${dateKey(ts)} ${String(ts.getHours()).padStart(2, "0")}:${String(ts.getMinutes()).padStart(2, "0")}`
+      : "时间不明";
+    return `[${stamp}] ${row.role === "user" ? userName : agentName}：${row.text}`;
+  };
+  const evidenceText = buildSignalAwareEvidence(partnerRows, signals, fmtRow, 8000);
+  const signalText = signals.length
+    ? signals.map((item) => `- ${item.kind}：${item.text}`).join("\n")
+    : "（本地没有命中明确际遇线索，细致档位仍可根据上下文谨慎判断）";
+  const prompt =
+    `你是拾光记的日子整理员。现在生活日 ${day}（从 ${range.start.toLocaleString("zh-CN")} 到 ${range.end.toLocaleString("zh-CN")}）已翻篇，请根据下面的可见对话，为「伙伴：${agentName}」整理当天的际遇，生成“自动发现候选”，不要把候选说成确定的心理事实。\n\n` +
+    `本地零 Token 预筛命中的际遇线索（praise=被夸被谢、rebuke=被凶被嫌、self=它自己表达了感受；只是线索，不代表最终判断）：\n${signalText}\n\n` +
+    `当天可见对话（只含 ${agentName} 与 ${userName} 的往来；方括号内是消息真实时间；“我”是 ${userName}）：\n${evidenceText || "（没有可用对话文字）"}\n\n` +
+    `请只输出一个 JSON 数组，不要任何其他文字。每条候选使用以下字段：\n` +
+    `[{ "mood": "情绪词", "segment": "上午|下午|晚上", "observedAt": "从消息方括号原样抄回的 YYYY-MM-DD HH:MM；无法确认就填空", "certainty": "clear|possible|uncertain", "evidenceType": "explicit|context", "evidence": "从对话原样摘出的短句；无法原样找到就填空", "why": "一句带不确定语气的推测，写清是哪种际遇（被夸/被谢/被凶/被晾/被需要/它自己表达了感受）；猜不出就填空" }]\n\n` +
+    `规则：\n` +
+    `- mood 只能从这些词里选：${whitelist}；选不出来就不输出那条。\n` +
+    `- 只判断“${agentName}”这一方的感受，且依据只能是它那天的际遇：被夸、被谢、被凶、被晾、被需要，或它自己明确说出的感受。\n` +
+    `- 它的服务性回应不算情绪：它安抚${userName}、说“我理解你”“别担心”这类共情话，不能推出它自己难过或担心。\n` +
+    `- segment 只填“上午/下午/晚上”；没有足够线索时可以填空，系统会把它记成宽泛的白天候选。\n` +
+    `- observedAt 只有在能和某条真实消息时间逐字对应时才填写，不能根据语义猜一个时间；无法对应就留空。\n` +
+    `- certainty 只能用 clear、possible、uncertain，不要输出 0-100 的心理分数。context 推测优先用 possible 或 uncertain。\n` +
+    `- evidence 必须是对话里的连续短摘录（“我”夸它/凶它的话，或它自己的原话都行），找不到原文就留空；why 可以为空，绝不硬安现实原因。\n` +
+    `- 没有可辨认际遇就输出 []，宁可少不要硬凑。`;
+  let raw;
+  try {
+    raw = await mcInstance.sample([{ role: "user", content: prompt }], {
+      maxTokens: 700,
+      temperature: 0.3,
+      timeoutMs: 45000,
+      callPurpose: "partner-mood-discovery",
+      reasoningLevel: "off",
+      retryOnEmpty: false,
+    });
+  } catch (e) {
+    const error = modelChannelErrorHint(e, data.getSettings().modelSource || "agent");
+    await saveState({ status: "failed", moodMode, attemptedAt, finishedAt: new Date().toISOString(), error: String(error).slice(0, 300) });
+    return { ok: false, error, agentId };
+  }
+  if (!String(raw || "").trim()) {
+    const error = modelChannelErrorHint("模型未回复正文", data.getSettings().modelSource || "agent");
+    await saveState({ status: "failed", moodMode, attemptedAt, finishedAt: new Date().toISOString(), error: String(error).slice(0, 300) });
+    return { ok: false, error, agentId };
+  }
+  const allowedObservedAt = partnerRows.filter((row) => Number.isFinite(Number(row.ts))).map((row) => row.ts);
+  const candidates = parseMoodOutput(raw, {
+    day,
+    now: new Date(),
+    allowedObservedAt,
+    evidenceSourceText: evidenceText,
+  });
+  // 伙伴链没有手动亲笔；同段同情绪去重交给 merge（lenient=false 严格口径），只留能站住的候选。
+  const merged = mergeMoodEntries([], candidates, { lenient: false });
+  if (merged.length) await data.replacePartnerDayMoods(day, agentId, merged);
+  await saveState({
+    status: "completed",
+    moodMode,
+    attemptedAt,
+    finishedAt: new Date().toISOString(),
+    candidateCount: candidates.length,
+    retainedAutoCount: merged.length,
+    messageCount: partnerRows.length,
+    explicitSignalCount: signals.length,
+  });
+  return { ok: true, agentId, agentName, candidateCount: candidates.length, autoCount: merged.length };
+}
+
 function registerMoodRoutes(app) {
   // 情绪集合（页面渲染用）
   app.get("/api/moods/meta", async (c) => {
@@ -1829,6 +2020,51 @@ function registerMoodRoutes(app) {
       return c.json({ ok: true, mood: decorateMoodEntry(updated), moods: moodEntriesForDate(date) });
     } catch (e) {
       return c.json({ ok: false, error: e?.message || "没改上" });
+    }
+  });
+
+  // ── 伙伴心情线（独立于用户的 moods，按 agentId 分组）──
+
+  // 某月伙伴心情速览：{ date: { agentId: [decorated entries] } }，附 agents 名映射
+  app.get("/api/partner-moods", async (c) => {
+    try {
+      const url = new URL(c.req.url, "http://localhost");
+      const ym = String(url.searchParams.get("month") || "");
+      if (!/^\d{4}-\d{2}$/.test(ym)) return c.json({ ok: false, error: "月份格式不对" });
+      const data = getData();
+      const days = {};
+      const agentIds = new Set();
+      for (const row of data.listPartnerMoods()) {
+        if (!String(row.date || "").startsWith(ym)) continue;
+        if (!days[row.date]) days[row.date] = {};
+        if (!days[row.date][row.agentId]) days[row.date][row.agentId] = [];
+        days[row.date][row.agentId].push(decorateMoodEntry(row));
+        agentIds.add(row.agentId);
+      }
+      const agents = {};
+      for (const agentId of agentIds) agents[agentId] = readAgentDisplayName(AGENTS_DIR, agentId) || agentId;
+      return c.json({ ok: true, month: ym, days, agents });
+    } catch (e) {
+      return c.json({ ok: false, error: e?.message || "读取失败" });
+    }
+  });
+
+  // 某天伙伴心情：{ agentId: [decorated] }（心情线页"看这天"与并行曲线用）
+  app.get("/api/partner-moods/:date", async (c) => {
+    try {
+      const date = c.req.param("date");
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) return c.json({ ok: false, error: "日期格式不对" });
+      const data = getData();
+      const byAgent = data.getPartnerDayMoods(date);
+      const partners = {};
+      const agents = {};
+      for (const agentId of Object.keys(byAgent)) {
+        partners[agentId] = byAgent[agentId].map(decorateMoodEntry);
+        agents[agentId] = readAgentDisplayName(AGENTS_DIR, agentId) || agentId;
+      }
+      return c.json({ ok: true, date, partners, agents, meta: MOODS });
+    } catch (e) {
+      return c.json({ ok: false, error: e?.message || "读取失败" });
     }
   });
 }
