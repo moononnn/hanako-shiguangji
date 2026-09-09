@@ -74,6 +74,10 @@ let mcInstance = null; // ModelConfig 实例（路由注册时创建，runDailyS
 let summaryTimer = null;
 let activeSummaryJobPromise = null;
 const summaryAttempts = new Map(); // date -> timestamp，失败时节流后可重试
+let activePartnerMoodJobPromise = null; // 伙伴心情历史补档单飞锁
+let partnerMoodSubmitQueue = Promise.resolve(); // 补档投递串行，防并发建任务
+const PARTNER_MOOD_JOB_ACTIVE_STATUSES = new Set(["queued", "running"]);
+const PARTNER_MOOD_BACKFILL_MAX_DATES = 31; // 与批量做册一致：一次最多 31 天
 const SUMMARY_REVISION_SESSION_TTL_MS = 30 * 60 * 1000;
 const SUMMARY_EVIDENCE_PRIMARY_CHARS = 8000;
 const SUMMARY_EVIDENCE_FALLBACK_CHARS = 4000;
@@ -1158,6 +1162,8 @@ export default function registerRoutes(app, ctx) {
 
   // 路由和模型配置都准备好后，再恢复上次未结束的后台总结任务。
   resumeSummaryJobs(ctx);
+  // 伙伴心情历史补档任务同样在启动时恢复（重启前没跑完的接着跑）。
+  resumePartnerMoodJobs();
 }
 
 // ── 每日总结（完整生活日 → 按伙伴调模型 → 加密归档） ──
@@ -1242,7 +1248,7 @@ async function runDailySummaryUnlocked(ctx, {
   let partnerMoodResults = null;
   if (!preview && settings.partnerMoodEnabled && moodMode !== "off") {
     try {
-      partnerMoodResults = await harvestPartnerMoodsForDay(ctx, { day, range, userName });
+      partnerMoodResults = await harvestPartnerMoodsForDay({ day, range, userName, force: forceMood });
       if (partnerMoodResults?.ok && !partnerMoodResults.skipped) {
         const finished = (partnerMoodResults.results || []).filter((r) => r.ok && !r.skipped).length;
         logInfo(`${day} 伙伴心情线整理完成：${finished} 位伙伴`);
@@ -1777,7 +1783,7 @@ async function harvestMoodForDay(ctx, { day, range, userName, messages = [], con
  * 只读拾光记自身可见消息；候选证据必须能锚当天原文，不外推心理事实。
  * 幂等：按 date|agentId 记录状态，重启不会重复调用；失败可随定时器在十分钟后重试。
  */
-async function harvestPartnerMoodsForDay(ctx, { day, range, userName } = {}) {
+async function harvestPartnerMoodsForDay({ day, range, userName, force = false } = {}) {
   const data = getData();
   const settings = data.getSettings();
   if (!settings.partnerMoodEnabled) return { ok: true, skipped: true, reason: "disabled" };
@@ -1814,18 +1820,19 @@ async function harvestPartnerMoodsForDay(ctx, { day, range, userName } = {}) {
   const results = [];
   for (const agentId of agentIdSet) {
     const previous = data.getPartnerMoodHarvestState(day, agentId);
-    if (isMoodHarvestTerminal(previous)) {
+    if (!force && isMoodHarvestTerminal(previous)) {
       results.push({ agentId, ok: true, skipped: true, reason: "already-handled" });
       continue;
     }
     try {
-      results.push(await harvestPartnerMoodForAgent(ctx, {
+      results.push(await harvestPartnerMoodForAgent({
         day,
         range: fullRange,
         userName,
         rows,
         agentId,
         moodMode,
+        force,
         whitelist: MOODS.map((m) => m.label).join("/"),
       }));
     } catch (e) {
@@ -1837,7 +1844,7 @@ async function harvestPartnerMoodsForDay(ctx, { day, range, userName } = {}) {
   return { ok: true, results };
 }
 
-async function harvestPartnerMoodForAgent(ctx, { day, range, userName, rows, agentId, moodMode, whitelist }) {
+async function harvestPartnerMoodForAgent({ day, range, userName, rows, agentId, moodMode, force = false, whitelist }) {
   const data = getData();
   const partnerRows = filterPartnerRows(rows, agentId);
   const saveState = async (patch) => {
@@ -1927,8 +1934,9 @@ async function harvestPartnerMoodForAgent(ctx, { day, range, userName, rows, age
     allowedObservedAt,
     evidenceSourceText: evidenceText,
   });
-  // 伙伴链没有手动亲笔；同段同情绪去重交给 merge（lenient=false 严格口径），只留能站住的候选。
-  const merged = mergeMoodEntries([], candidates, { lenient: false });
+  // 伙伴链没有手动亲笔；当天自动走严格口径（同段同情绪去重，只留能站住的候选）；
+  // 历史补档（force=true）走宽松口径：同段不同情绪允许共存，一天的情绪起伏不被砍平。
+  const merged = mergeMoodEntries([], candidates, { lenient: !!force });
   if (merged.length) await data.replacePartnerDayMoods(day, agentId, merged);
   await saveState({
     status: "completed",
@@ -1941,6 +1949,138 @@ async function harvestPartnerMoodForAgent(ctx, { day, range, userName, rows, age
     explicitSignalCount: signals.length,
   });
   return { ok: true, agentId, agentName, candidateCount: candidates.length, autoCount: merged.length };
+}
+
+// ── 伙伴心情历史补档（后台任务：只补际遇线，不碰做册总结）──
+
+function normalizePartnerMoodDates(value, boundaryHour) {
+  const list = Array.isArray(value) ? value : [value];
+  const latestFinished = finishedLifeDayKey(new Date(), boundaryHour);
+  const dates = [...new Set(list.map((item) => String(item || "").trim()).filter(Boolean))].sort();
+  if (!dates.length) return { error: "至少选一天" };
+  if (dates.length > PARTNER_MOOD_BACKFILL_MAX_DATES) return { error: `一次最多补 ${PARTNER_MOOD_BACKFILL_MAX_DATES} 天` };
+  for (const date of dates) {
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) return { error: `日期格式不对：${date}` };
+    const parsed = new Date(`${date}T00:00:00`);
+    if (Number.isNaN(parsed.getTime()) || dateKey(parsed) !== date) return { error: `日期无效：${date}` };
+    if (date > latestFinished) return { error: `${date} 还没有结束，先选已经过去的日子` };
+  }
+  return { dates };
+}
+
+function decoratePartnerMoodJob(job) {
+  if (!job) return null;
+  const dates = Array.isArray(job.dates) ? job.dates : [];
+  const outcomes = Array.isArray(job.outcomes) ? job.outcomes : [];
+  return {
+    ...job,
+    progress: { done: outcomes.filter((item) => item.status !== "failed").length, total: dates.length },
+    failed: outcomes.filter((item) => item.status === "failed").length,
+  };
+}
+
+function findActivePartnerMoodJob(data) {
+  return data.listPartnerMoodJobs(true)[0] || null;
+}
+
+function makePartnerMoodJobOutcome(date, result) {
+  if (result && result.ok) {
+    return { date, status: "completed", count: Number(result.count) || 0, updatedAt: new Date().toISOString() };
+  }
+  return { date, status: "failed", error: String(result?.error || "这一天没补上").slice(0, 300), updatedAt: new Date().toISOString() };
+}
+
+function submitPartnerMoodBackfill(dates) {
+  return (partnerMoodSubmitQueue = partnerMoodSubmitQueue.catch(() => {}).then(async () => {
+    const data = getData();
+    const active = findActivePartnerMoodJob(data);
+    if (active) return { ok: false, error: "已经有一项伙伴心情补档在运行", job: decoratePartnerMoodJob(active) };
+    const job = await data.createPartnerMoodJob({ dates });
+    startPartnerMoodJob(job.id);
+    return { ok: true, job: decoratePartnerMoodJob(job) };
+  }));
+}
+
+function startPartnerMoodJob(jobId) {
+  if (activePartnerMoodJobPromise) return activePartnerMoodJobPromise;
+  const job = getData().getPartnerMoodJob(jobId);
+  if (!job || !PARTNER_MOOD_JOB_ACTIVE_STATUSES.has(job.status)) return null;
+  activePartnerMoodJobPromise = processPartnerMoodJob(jobId).finally(() => {
+    activePartnerMoodJobPromise = null;
+    // 前一个任务结束后，若已有排队任务则继续接起来。
+    setTimeout(() => resumePartnerMoodJobs(), 0);
+  });
+  return activePartnerMoodJobPromise;
+}
+
+function resumePartnerMoodJobs() {
+  if (activePartnerMoodJobPromise) return;
+  const job = getData().listPartnerMoodJobs(true)[0];
+  if (job) startPartnerMoodJob(job.id);
+}
+
+async function processPartnerMoodJob(jobId) {
+  const data = getData();
+  let job = data.getPartnerMoodJob(jobId);
+  if (!job) return;
+  try {
+    await data.updatePartnerMoodJob(jobId, { status: "running", currentDate: "", error: "" });
+    const settings = data.getSettings();
+    const boundary = normalizeBoundaryHour(settings.dayBoundaryHour);
+    for (const date of Array.isArray(job.dates) ? job.dates : []) {
+      job = data.getPartnerMoodJob(jobId);
+      if (!job) return;
+      const outcomes = Array.isArray(job.outcomes) ? job.outcomes : [];
+      if (outcomes.some((outcome) => outcome.date === date)) continue;
+      await data.updatePartnerMoodJob(jobId, { status: "running", currentDate: date, error: "" });
+      let result;
+      try {
+        // 补档=用户主动翻历史：force=true 强制重扫（忽略幂等），宽松口径保留一天的情绪起伏；
+        // 只跑伙伴际遇链，不经过做册流程，已定稿的总结页一个字都不会动。
+        const harvest = await harvestPartnerMoodsForDay({ day: date, force: true });
+        if (!harvest.ok) {
+          result = { ok: false, error: harvest.error || "这一天没补上" };
+        } else {
+          const finished = (harvest.results || []).filter((r) => r.ok && !r.skipped);
+          const counts = finished.map((r) => Number(r.autoCount) || 0);
+          result = { ok: true, count: counts.reduce((sum, n) => sum + n, 0), partnerCount: finished.length };
+        }
+      } catch (e) {
+        result = { ok: false, error: e?.message || "这一天没补上" };
+      }
+      const outcome = makePartnerMoodJobOutcome(date, result);
+      job = data.getPartnerMoodJob(jobId);
+      if (!job) return;
+      const nextOutcomes = [
+        ...(Array.isArray(job.outcomes) ? job.outcomes : []).filter((item) => item.date !== date),
+        outcome,
+      ];
+      await data.updatePartnerMoodJob(jobId, {
+        status: "running",
+        currentDate: "",
+        outcomes: nextOutcomes,
+        error: outcome.status === "failed" ? outcome.error : "",
+      });
+    }
+    job = data.getPartnerMoodJob(jobId);
+    if (!job) return;
+    const failed = (job.outcomes || []).filter((outcome) => outcome.status === "failed").length;
+    await data.updatePartnerMoodJob(jobId, {
+      status: failed ? "completed_with_errors" : "completed",
+      currentDate: "",
+      error: failed ? `${failed} 天没补上，可以重新发起` : "",
+    });
+  } catch (e) {
+    try {
+      await data.updatePartnerMoodJob(jobId, {
+        status: "failed",
+        currentDate: "",
+        error: String(e?.message || "伙伴心情补档任务中断").slice(0, 300),
+      });
+    } catch {
+      // 状态写入也失败时不再抛未处理异常。
+    }
+  }
 }
 
 function registerMoodRoutes(app) {
@@ -2065,6 +2205,51 @@ function registerMoodRoutes(app) {
       return c.json({ ok: true, date, partners, agents, meta: MOODS });
     } catch (e) {
       return c.json({ ok: false, error: e?.message || "读取失败" });
+    }
+  });
+
+  // 历史补档：对选中的过去生活日批量跑伙伴际遇链（force 宽松），不碰做册总结
+  app.post("/api/partner-moods/backfill", async (c) => {
+    try {
+      const body = (await c.req.json().catch(() => ({}))) || {};
+      const data = getData();
+      const settings = data.getSettings();
+      if (!settings.partnerMoodEnabled) return c.json({ ok: false, error: "先在设置里打开伙伴心情线" });
+      if (normalizeMoodDiscoveryMode(settings.moodDiscoveryMode) === "off") {
+        return c.json({ ok: false, error: "自动情绪发现关着，伙伴心情线不会跑" });
+      }
+      const normalized = normalizePartnerMoodDates(body.dates, normalizeBoundaryHour(settings.dayBoundaryHour));
+      if (normalized.error) return c.json({ ok: false, error: normalized.error });
+      return c.json(await submitPartnerMoodBackfill(normalized.dates));
+    } catch (e) {
+      return c.json({ ok: false, error: e?.message || "补档任务创建失败" });
+    }
+  });
+
+  // 补档任务进度（独立路径，避免与 /api/partner-moods/:date 撞车）
+  app.get("/api/partner-moods-jobs", async (c) => {
+    try {
+      const data = getData();
+      const jobs = data.listPartnerMoodJobs().slice(0, 5).map(decoratePartnerMoodJob);
+      return c.json({ ok: true, jobs, active: !!findActivePartnerMoodJob(data) });
+    } catch (e) {
+      return c.json({ ok: false, error: e?.message || "读取失败" });
+    }
+  });
+
+  // 确认收下：跑完的补档卡退场，刷新后不再弹（有失败天数的也允许收下）
+  app.post("/api/partner-moods-jobs/:id/dismiss", async (c) => {
+    try {
+      const data = getData();
+      const job = data.getPartnerMoodJob(c.req.param("id"));
+      if (!job) return c.json({ ok: false, error: "找不到这项补档任务" });
+      if (job.status !== "completed" && job.status !== "completed_with_errors") {
+        return c.json({ ok: false, error: "补档还没跑完，先等它一会儿" });
+      }
+      await data.updatePartnerMoodJob(job.id, { dismissedAt: new Date().toISOString() });
+      return c.json({ ok: true, job: decoratePartnerMoodJob(data.getPartnerMoodJob(job.id)) });
+    } catch (e) {
+      return c.json({ ok: false, error: e?.message || "确认失败" });
     }
   });
 }
