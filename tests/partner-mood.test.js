@@ -317,3 +317,118 @@ test("路由：做册全不选或开关关着时伙伴链不跑", () => {
   assert.equal(result.status, 0, result.stderr || result.stdout);
   assert.match(result.stdout, /"partnerCalls":0/);
 });
+
+// ── 补档任务 ──
+
+test("补档任务账本：创建/读取/更新/活跃互斥/重启保留", async () => {
+  const d = tmpDir("partner-mood-jobs");
+  const ud = new UserData(d);
+  const job = await ud.createPartnerMoodJob({ dates: ["2026-09-01", "2026-09-02"] });
+  assert.equal(job.status, "queued");
+  // 活跃任务存在时不允许再建
+  await assert.rejects(() => ud.createPartnerMoodJob({ dates: ["2026-09-03"] }), /已经有一项伙伴心情补档/);
+  await ud.updatePartnerMoodJob(job.id, { status: "completed", outcomes: [{ date: "2026-09-01", status: "completed" }] });
+  // 完成后可以再建
+  const job2 = await ud.createPartnerMoodJob({ dates: ["2026-09-03"] });
+  assert.ok(job2.id !== job.id);
+  const restored = new UserData(d);
+  assert.equal(restored.getPartnerMoodJob(job.id).status, "completed", "重启保留");
+  assert.equal(restored.listPartnerMoodJobs()[0].id, job2.id, "最新在前");
+  await ud.updatePartnerMoodJob(job2.id, { status: "completed" });
+  assert.equal(ud.listPartnerMoodJobs(true).length, 0, "无活跃任务时 activeOnly 为空");
+});
+
+test("页面：批量多选区包含补记伙伴心情入口与进度容器", async () => {
+  const { renderPage } = await import(pathToFileURL(path.resolve("lib/page-template.js")).href);
+  const html = renderPage("test-token");
+  assert.match(html, /partner-mood-backfill-btn/, "补记伙伴心情按钮存在");
+  assert.match(html, /runPartnerMoodBackfill/, "按钮绑定补档投递");
+  assert.match(html, /partner-mood-jobs-calendar/, "补档进度容器存在");
+  assert.match(html, /loadPartnerMoodJobs/, "页面会轮询补档进度");
+  assert.match(html, /只收情绪，不会改动已定稿的总结页/, "按钮提示讲清不碰总结");
+});
+
+test("路由：历史批量补档端到端（force 宽松，不碰总结）", () => {
+  const isolatedHome = fs.mkdtempSync(path.join(os.tmpdir(), "sgj-partner-mood-backfill-"));
+  const routeUrl = pathToFileURL(path.resolve("routes/ui.js")).href;
+  const dataUrl = pathToFileURL(path.resolve("lib/data.js")).href;
+  const childCode = `
+    import fs from "node:fs";
+    import path from "node:path";
+    import os from "node:os";
+    import { UserData } from ${JSON.stringify(dataUrl)};
+    import registerRoutes from ${JSON.stringify(routeUrl)};
+    const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+    const home = path.join(os.homedir(), ".hanako");
+    const agents = path.join(home, "agents", "hanako");
+    const sessions = path.join(agents, "sessions");
+    const dataDir = path.join(home, "plugin-data", "shiguangji");
+    fs.mkdirSync(sessions, { recursive: true });
+    fs.writeFileSync(path.join(home, "users.json"), JSON.stringify({ displayName: "小测试" }));
+    fs.writeFileSync(path.join(agents, "config.yaml"), "agent:\\n  name: 小花\\n");
+    const write = (date, hour, text, role) => {
+      fs.appendFileSync(path.join(sessions, "one.jsonl"),
+        JSON.stringify({ type: "message", timestamp: date + "T" + hour + ":00+08:00", message: { role, content: text } }) + "\\n");
+    };
+    // 两个过去的生活日，各有一次被夸
+    write("2026-09-01", "10:00", "小花你真棒，第一天搞定", "user");
+    write("2026-09-01", "10:01", "嘿嘿谢谢", "assistant");
+    write("2026-09-02", "15:00", "第二天也靠你啦，太靠谱了", "user");
+    write("2026-09-02", "15:01", "交给我放心", "assistant");
+    const data = new UserData(dataDir);
+    // 先全关再注册，避免注册瞬间的首轮定时检查抢先跑
+    await data.updateSettings({ autoSummary: false, moodDiscoveryMode: "off", partnerMoodEnabled: false });
+    const calls = [];
+    const ctx = {
+      dataDir,
+      bus: { async request(topic, input) {
+        calls.push({ topic, input });
+        if (input.callPurpose === "partner-mood-discovery") {
+          return { text: JSON.stringify([{ mood: "开心", segment: "上午", certainty: "clear", evidenceType: "explicit", evidence: "你真棒", why: "早上被夸" }]) };
+        }
+        return { text: "" };
+      } },
+      log: { info() {}, warn() {}, error() {} },
+    };
+    const routes = [];
+    const app = {
+      get(p, h) { routes.push({ method: "GET", path: p, handler: h }); },
+      post(p, h) { routes.push({ method: "POST", path: p, handler: h }); },
+      put(p, h) { routes.push({ method: "PUT", path: p, handler: h }); },
+      delete(p, h) { routes.push({ method: "DELETE", path: p, handler: h }); },
+    };
+    registerRoutes(app, ctx);
+    // 设置更新必须走路由 handler（shared 实例有内存缓存，跨实例直接改文件读不到）
+    const settingsPost = routes.find((item) => item.method === "POST" && item.path === "/api/settings");
+    const settingsRes = await settingsPost.handler({ req: { async json() { return { moodDiscoveryMode: "economical", partnerMoodEnabled: true }; } }, json(value) { return value; } });
+    if (!settingsRes.ok) throw new Error("设置没更新成功：" + JSON.stringify(settingsRes));
+    const post = routes.find((item) => item.method === "POST" && item.path === "/api/partner-moods/backfill");
+    if (!post) throw new Error("补档路由未注册");
+    const created = await post.handler({ req: { async json() { return { dates: ["2026-09-01", "2026-09-02"] }; } }, json(value) { return value; } });
+    if (!created.ok) throw new Error("补档任务创建失败：" + JSON.stringify(created));
+    const jobId = created.job.id;
+    let job = new UserData(dataDir).getPartnerMoodJob(jobId);
+    for (let i = 0; i < 60 && job && ["queued", "running"].includes(job.status); i++) {
+      await sleep(150);
+      job = new UserData(dataDir).getPartnerMoodJob(jobId);
+    }
+    if (!job || job.status !== "completed") throw new Error("补档任务没跑完：" + JSON.stringify(job));
+    const day1 = new UserData(dataDir).getPartnerMoods("2026-09-01", "hanako");
+    const day2 = new UserData(dataDir).getPartnerMoods("2026-09-02", "hanako");
+    if (day1.length !== 1 || day2.length !== 1) throw new Error("补档没有落库：" + JSON.stringify({ day1, day2, outcomes: job.outcomes }));
+    if (day1[0].mood !== "happy" || day2[0].mood !== "happy") throw new Error("情绪词不对：" + JSON.stringify({ day1, day2 }));
+    if (day1[0].evidence !== "你真棒") throw new Error("证据没保真：" + JSON.stringify(day1[0]));
+    // 已定稿的总结没被这次补档碰过
+    const summaries = new UserData(dataDir).listSummaryEntries("2026-09-01");
+    console.log(JSON.stringify({ partnerCalls: calls.filter((call) => call.input.callPurpose === "partner-mood-discovery").length, jobStatus: job.status, summaryCount: summaries.length }));
+  `;
+  const result = spawnSync(process.execPath, ["--input-type=module", "-e", childCode], {
+    encoding: "utf8",
+    cwd: path.resolve("."),
+    env: { ...process.env, USERPROFILE: isolatedHome, HOME: isolatedHome, HANA_HOME: path.join(isolatedHome, ".hanako") },
+  });
+  assert.equal(result.status, 0, result.stderr || result.stdout);
+  assert.match(result.stdout, /"partnerCalls":2/);
+  assert.match(result.stdout, /"jobStatus":"completed"/);
+  assert.match(result.stdout, /"summaryCount":0/, "补档不碰总结");
+});
