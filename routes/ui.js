@@ -204,6 +204,9 @@ function publicSettings(s) {
     weatherLocation: s.weatherLocation || "",
     weatherArea: resolveWeatherLocation(s).area || null,
     weatherIntervalHours: s.weatherIntervalHours || 3,
+    // 当前模型档关不掉思考时，页面要提醒用户「消耗明显更多，建议换一个能关思考的档」。
+    thinkingUnstoppable: isThinkingUnstoppable(s),
+    thinkingModelKey: currentModelKey(s),
   };
 }
 
@@ -307,7 +310,17 @@ export default function registerRoutes(app, ctx) {
   configureDebugLog(ctx?.dataDir);
   // 页面路由拿得到插件 ctx；把宿主网络能力交给扩展的后台天气刷新复用。
   const weatherFetcher = configureWeatherNetwork(ctx?.network);
-  const mc = new ModelConfig({ ctx, store: makeSettingsStore() });
+  // 把 model-config 的日志接到插件自己的日志文件。
+  // 它内部那条「模型未交付可见正文，准备同模型重试（hadThinking=…, finishReason=…）」走的
+  // 是 ctx.log，默认只进宿主进程日志，出问题时查不到——而这条恰恰是判断「思考耗尽」还是
+  // 「服务端真空」的唯一证据。诊断必须有落点。
+  const summarizeErrorPart = (v) => (v?.message || (typeof v === "string" ? v : JSON.stringify(v)));
+  const mcLogger = {
+    info: (msg, ...rest) => logInfo(`[model] ${msg}${rest.length ? " " + rest.map(summarizeErrorPart).join(" ") : ""}`),
+    warn: (msg, ...rest) => logWarn(`[model] ${msg}${rest.length ? " " + rest.map(summarizeErrorPart).join(" ") : ""}`),
+    error: (msg, ...rest) => logError(`[model] ${msg}${rest.length ? " " + rest.map(summarizeErrorPart).join(" ") : ""}`),
+  };
+  const mc = new ModelConfig({ ctx: { ...ctx, log: mcLogger }, store: makeSettingsStore() });
   mcInstance = mc;
   // 这版直接回到三档模型契约：旧测试版可能留下的 Hana 地址/Key 只清理一次，
   // 以后 Hana 档永远只保存 provider/model，凭据从 Hana 运行时读取。
