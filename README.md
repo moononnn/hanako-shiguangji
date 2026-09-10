@@ -2,7 +2,7 @@
 
 > 给 Hana 里的每一天，留一页可以回看的光。
 
-当前版本：`0.2.103`
+当前版本：`0.2.114`
 
 ## ⚠️ 先说清楚
 
@@ -158,7 +158,7 @@ node --test tests/*.test.js
 Get-ChildItem -Recurse -Filter *.js | ForEach-Object { node --check $_.FullName }
 ```
 
-当前版本最近一次自动测试结果：`206/206` 通过。
+当前版本最近一次自动测试结果：`314/314` 通过。
 
 ## 致谢
 
