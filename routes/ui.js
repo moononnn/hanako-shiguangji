@@ -40,6 +40,7 @@ import {
   mergeSummaryGroups,
   normalizeBoundaryHour,
   readAgentDisplayName,
+  isSyntheticSummaryText,
   sanitizeVisibleText,
 } from "../lib/day-summary.js";
 import { selectRecentSummaries } from "../lib/recent-summaries.js";
@@ -193,6 +194,7 @@ function publicSettings(s) {
     injectIntervalHours: s.injectIntervalHours,
     autoSummary: s.autoSummary,
     moodDiscoveryMode: normalizeMoodDiscoveryMode(s.moodDiscoveryMode),
+    partnerMoodEnabled: s.partnerMoodEnabled === true,
     dayBoundaryHour: normalizeBoundaryHour(s.dayBoundaryHour),
     summaryAgentIds: normalizeSummaryAgentIds(s.summaryAgentIds),
     summaryAgents: listSummaryAgents(AGENTS_DIR),
@@ -2027,6 +2029,7 @@ async function processPartnerMoodJob(jobId) {
     await data.updatePartnerMoodJob(jobId, { status: "running", currentDate: "", error: "" });
     const settings = data.getSettings();
     const boundary = normalizeBoundaryHour(settings.dayBoundaryHour);
+    const userName = readHanaUserName() || "对方";
     for (const date of Array.isArray(job.dates) ? job.dates : []) {
       job = data.getPartnerMoodJob(jobId);
       if (!job) return;
@@ -2037,7 +2040,7 @@ async function processPartnerMoodJob(jobId) {
       try {
         // 补档=用户主动翻历史：force=true 强制重扫（忽略幂等），宽松口径保留一天的情绪起伏；
         // 只跑伙伴际遇链，不经过做册流程，已定稿的总结页一个字都不会动。
-        const harvest = await harvestPartnerMoodsForDay({ day: date, force: true });
+        const harvest = await harvestPartnerMoodsForDay({ day: date, userName, force: true });
         if (!harvest.ok) {
           result = { ok: false, error: harvest.error || "这一天没补上" };
         } else {

@@ -180,6 +180,40 @@ test("设置：伙伴心情线默认关，可开启，重启保留", async () =>
   assert.equal(restored.getSettings().partnerMoodEnabled, true);
 });
 
+test("路由：伙伴心情线开关通过设置接口回显", () => {
+  const isolatedHome = fs.mkdtempSync(path.join(os.tmpdir(), "sgj-partner-mood-settings-route-"));
+  const routeUrl = pathToFileURL(path.resolve("routes/ui.js")).href;
+  const childCode = `
+    import path from "node:path";
+    import registerRoutes from ${JSON.stringify(routeUrl)};
+    const dataDir = path.join(process.env.HANA_HOME, "plugin-data", "shiguangji");
+    const routes = [];
+    const app = {
+      get(path, handler) { routes.push({ method: "GET", path, handler }); },
+      post(path, handler) { routes.push({ method: "POST", path, handler }); },
+      put() {},
+      delete() {},
+    };
+    registerRoutes(app, { dataDir, log: { info() {}, warn() {}, error() {} } });
+    const get = routes.find((item) => item.method === "GET" && item.path === "/api/settings");
+    const post = routes.find((item) => item.method === "POST" && item.path === "/api/settings");
+    const request = (body) => ({ req: { async json() { return body; } }, json(value) { return value; } });
+    const saved = await post.handler(request({ partnerMoodEnabled: true }));
+    const loaded = await get.handler({ json(value) { return value; } });
+    if (!saved.ok || saved.settings.partnerMoodEnabled !== true) throw new Error("保存响应没有回显伙伴心情线开关：" + JSON.stringify(saved));
+    if (!loaded.ok || loaded.settings.partnerMoodEnabled !== true) throw new Error("重新读取没有回显伙伴心情线开关：" + JSON.stringify(loaded));
+    console.log(JSON.stringify({ saved: saved.settings.partnerMoodEnabled, loaded: loaded.settings.partnerMoodEnabled }));
+  `;
+  const result = spawnSync(process.execPath, ["--input-type=module", "-e", childCode], {
+    encoding: "utf8",
+    cwd: path.resolve("."),
+    env: { ...process.env, USERPROFILE: isolatedHome, HOME: isolatedHome, HANA_HOME: path.join(isolatedHome, ".hanako") },
+  });
+  assert.equal(result.status, 0, result.stderr || result.stdout);
+  assert.match(result.stdout, /"saved":true/);
+  assert.match(result.stdout, /"loaded":true/);
+});
+
 // ── 页面与路由 ──
 
 test("页面：模板包含伙伴心情线开关、图例与伙伴点渲染逻辑", async () => {
