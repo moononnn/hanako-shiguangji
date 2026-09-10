@@ -5,6 +5,7 @@
 ## 版本与发布档位
 
 - `manifest.json` 与 `package.json` 的版本号必须完全一致。
+- **每次推送都顺手同步 README 版本行**（2026-09-10 约定）：`README.md` 顶部的「当前版本」要改成同一个版本号，「当前版本最近一次自动测试结果」的数字一并更新。README 是用户第一眼看到的版本来源，漏改就会出现页面版本与插件版本不一致（v0.2.114 发布时就踩过一次，靠独立审查抓出来）。
 - 每个逻辑独立、可测试、可回滚的改动单独提交，避免把无关改动揉成一个提交。
 - 小改动（纯美化、无用户流程变化的小修复、文案微调）：推送 `main` 并创建同版本 tag，不创建 Release。
 - 功能级改动或需要用户下载新安装包时：按完整 Release 流程执行。
@@ -39,7 +40,7 @@ gh run list --workflow CI --limit 5
 
 只有功能级改动或用户需要下载新安装包时执行：
 
-1. 对照 `manifest.json`、`package.json`、tag、CHANGELOG 和 Release 标题核对完整版本号。
+1. 对照 `manifest.json`、`package.json`、`README.md` 版本行、tag、CHANGELOG 和 Release 标题核对完整版本号。
 2. 生成干净发布目录，只保留 manifest、代码、前端资源、README、许可证和必要声明；排除测试文件、运行时数据、日志、备份、`node_modules` 和本地临时文件。
 3. 对干净发布目录运行语法检查、自动测试、命名红线和安装结构检查。
 4. 使用 .NET `ZipFile.CreateFromDirectory` 或 7z 打包，禁止用 tar 打 zip；检查 zip 条目不得有 `./`、绝对路径或 `../`。
