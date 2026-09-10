@@ -274,10 +274,11 @@ test("扩展：重启后同一旧窗口不重复播报，真新窗口照常开�
     const first = pi1._handlers["before_agent_start"]({}, ctxA);
     assert.equal(first.message.details.deepseekNotice, true, "重启前：新窗口开场带当前时段");
 
-    // 等峰谷状态落盘完成（EncryptedStore 写队列串行：追加一个空 update 排到队尾）
+    // 等两套会话状态落盘完成（EncryptedStore 写队列串行：追加空 update 排到各自队尾）。
+    await data1.injectionState.update(() => {});
     await data1.deepseekPeak.update(() => {});
 
-    // 模拟进程重启：清空内存 tracker，盘上 deepseekPeak store 保留；同一数据目录重建实例 = 重新读盘
+    // 模拟进程重启：清空内存 tracker，盘上两套状态保留；同一数据目录重建实例 = 重新读盘
     __clearInjectTrackersForTest();
     const data2 = new UserData(dir);
     __setSharedUserDataForTest(data2);
@@ -285,10 +286,7 @@ test("扩展：重启后同一旧窗口不重复播报，真新窗口照常开�
     registerShiguangjiInject(pi2);
 
     const second = pi2._handlers["before_agent_start"]({}, ctxA);
-    if (second?.message) {
-      assert.equal(second.message.details.deepseekNotice, false, "重启后旧窗口不再当新窗口重复播报");
-      assert.ok(!second.message.content.includes("模型峰谷关照"), second.message.content);
-    }
+    assert.equal(second, undefined, "重启后旧窗口在间隔内不应再次注入整段情境");
 
     // 真新窗口：开场仍照常播报当前时段
     const ctxB = {
@@ -297,6 +295,81 @@ test("扩展：重启后同一旧窗口不重复播报，真新窗口照常开�
     };
     const fresh = pi2._handlers["before_agent_start"]({}, ctxB);
     assert.equal(fresh.message.details.deepseekNotice, true, "真新窗口开场仍带当前时段");
+  } finally {
+    __setInjectNowForTest(null);
+    __setSharedUserDataForTest(new UserData(TEST_DATA_DIR));
+  }
+});
+
+test("扩展：只有旧版 DeepSeek 状态时，重启不伪造设置变化", async () => {
+  const dir = path.join(os.tmpdir(), `sgj-legacy-restart-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+  const data = new UserData(dir);
+  __setSharedUserDataForTest(data);
+  const now = new Date("2026-09-07T09:30:00+08:00");
+  __setInjectNowForTest(() => now);
+  await data.addEvent({ title: "旧状态兼容锚点", type: "event", date: dateKey(now) });
+  await data.setDeepSeekPeakState("legacy-restart-session", {
+    dsActive: false,
+    dsModelKey: "",
+    dsPeriod: null,
+    dsPreviewKey: "",
+    dsPreviewKeys: [],
+    dsLastSeenAt: now.getTime(),
+  });
+  await data.deepseekPeak.update(() => {});
+  try {
+    const pi = makePi();
+    registerShiguangjiInject(pi);
+    const result = pi._handlers["before_agent_start"]({}, {
+      sessionManager: { getSessionId: () => "legacy-restart-session" },
+    });
+    assert.equal(result, undefined, "只有旧版 DeepSeek 状态时不应伪造 settings-changed");
+  } finally {
+    __setInjectNowForTest(null);
+    __setSharedUserDataForTest(new UserData(TEST_DATA_DIR));
+  }
+});
+
+test("扩展：情境强制刷新时同一天气在可见冷却内不重复", async () => {
+  const dir = path.join(os.tmpdir(), `sgj-weather-throttle-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+  const data = new UserData(dir);
+  __setSharedUserDataForTest(data);
+  const now = new Date("2026-09-09T10:00:00+08:00");
+  __setInjectNowForTest(() => now);
+  const location = "四川省 成都市 武侯区";
+  await data.updateSettings({
+    weatherLocation: location,
+    weatherArea: { code: "510107" },
+    weatherIntervalHours: 3,
+  });
+  await data.addEvent({ title: "天气节流锚点", type: "event", date: dateKey(now) });
+  await data.setWeatherCache({
+    location,
+    fetchedAt: now.getTime(),
+    result: { place: location, line: "阴天，18°C", temp: 18, code: 3, isDay: true },
+  });
+  try {
+    const pi = makePi();
+    registerShiguangjiInject(pi);
+    const ctx = { sessionManager: { getSessionId: () => "weather-throttle-session" } };
+    const first = pi._handlers["before_agent_start"]({}, ctx);
+    assert.ok(first?.message, "首次情境仍应注入");
+    assert.ok(first.message.content.includes("【窗外】阴天，18°C"), first.message.content);
+
+    await data.updateSettings({ summaryShared: true });
+    const sameFact = pi._handlers["before_agent_start"]({}, ctx);
+    assert.ok(sameFact?.message, "设置变化仍应刷新其他情境");
+    assert.ok(!sameFact.message.content.includes("窗外"), sameFact.message.content);
+
+    await data.setWeatherCache({
+      location,
+      fetchedAt: now.getTime(),
+      result: { place: location, line: "小雨，17°C", temp: 17, code: 61, isDay: true },
+    });
+    await data.updateSettings({ showPeriod: false });
+    const changedFact = pi._handlers["before_agent_start"]({}, ctx);
+    assert.ok(changedFact?.message, "天气事实变化时仍应刷新情境");
+    assert.ok(changedFact.message.content.includes("【窗外】小雨，17°C"), changedFact.message.content);
   } finally {
     __setInjectNowForTest(null);
     __setSharedUserDataForTest(new UserData(TEST_DATA_DIR));

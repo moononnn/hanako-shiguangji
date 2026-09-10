@@ -13,7 +13,13 @@ import path from "node:path";
 import fs from "node:fs";
 
 import { encryptJson, decryptJson, EncryptedStore, loadOrCreateKey } from "../lib/crypto-store.js";
-import { shouldInject, buildInjectionText, InjectionTracker } from "../lib/inject.js";
+import {
+  shouldInject,
+  buildInjectionText,
+  InjectionTracker,
+  decideWeatherMention,
+  weatherFactKey,
+} from "../lib/inject.js";
 import { decideDeepSeekNotice, getDeepSeekTimeInfo, isDeepSeekModel } from "../lib/deepseek-peak.js";
 import { getBuiltinFestivals, isWorkday, getMonthFestivals } from "../lib/festivals.js";
 import {
@@ -222,6 +228,45 @@ test("注入：设置上下文变化立即刷新，不等间隔", () => {
   assert.equal(r.should, true);
   assert.equal(r.reason, "settings-changed");
   assert.equal(r.newState.contextKey, "new");
+});
+
+test("天气可见节流：同一事实冷却内不重复，事实变化或冷却到期才重现", () => {
+  const firstAt = new Date("2026-09-09T10:00:00+08:00");
+  const weather = {
+    place: "四川省 成都市 武侯区",
+    line: "阴天，18°C",
+    temp: 18,
+    code: 3,
+    isDay: true,
+  };
+  const first = decideWeatherMention({ weather, now: firstAt });
+  assert.equal(first.should, true);
+  assert.equal(first.factKey, weatherFactKey(weather));
+
+  const state = {
+    weatherLastMentionAt: firstAt.getTime(),
+    weatherLastFactKey: first.factKey,
+  };
+  const rewordedSoon = decideWeatherMention({
+    weather: { ...weather, line: "阴天，18°C，傍晚时分" },
+    lastState: state,
+    now: new Date("2026-09-09T10:30:00+08:00"),
+  });
+  assert.equal(rewordedSoon.should, false, "只变了时段措辞不能当成新天气");
+
+  const changedSoon = decideWeatherMention({
+    weather: { ...weather, line: "小雨，17°C", temp: 17, code: 61 },
+    lastState: state,
+    now: new Date("2026-09-09T10:30:00+08:00"),
+  });
+  assert.equal(changedSoon.should, true, "天气事实变化时应允许及时更新");
+
+  const afterCooldown = decideWeatherMention({
+    weather,
+    lastState: state,
+    now: new Date("2026-09-09T13:01:00+08:00"),
+  });
+  assert.equal(afterCooldown.should, true, "同一事实冷却到期后可再次提及");
 });
 
 test("注入：相伴的30分钟和常在的每轮行为不同", () => {
