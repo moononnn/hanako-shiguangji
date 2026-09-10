@@ -694,6 +694,9 @@ test("页面：模板包含情绪面板、心情时间线与心情线页面", as
   assert.match(html, /moodLinePointX/, "精确手动记录应在宽时段内部展开");
   assert.match(html, /moodLineEntryTimeLabel/, "手动记录应显示真实时刻");
   assert.match(html, /moodline-hover-tip|showMoodLineTooltip/, "心情点应使用亮色自绘提示，不走浏览器原生黑框");
+  assert.match(html, /\.moodline-plot \{[^}]*position:\s*relative/s, "提示气泡应以心情图为定位参照，不能漂到页面顶部");
+  assert.match(html, /max-width:\s*min\(360px, calc\(100% - 16px\)\)/, "提示气泡应限制宽度");
+  assert.match(html, /white-space:\s*normal[^}]*overflow-wrap:\s*anywhere/s, "长提示应在气泡内换行");
   assert.match(html, /data-tooltip/, "心情点应带可访问的提示文本");
   assert.match(html, /小花发现的候选/, "自动记录应明确是候选而不是确定事实");
   assert.match(html, /entry-source|pill-source|tl-source/, "自动记录在页面表层应有候选标记");
