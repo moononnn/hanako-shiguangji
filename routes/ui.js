@@ -12,6 +12,7 @@ import { configureSharedUserData, getSharedUserData } from "../lib/shared-data.j
 import { getBuiltinFestivals, isWorkday, getMonthFestivals } from "../lib/festivals.js";
 import { ModelConfig } from "../lib/model-config/index.js";
 import { buildInjectionText } from "../lib/inject.js";
+import { notifyAutoSummaryPaused } from "../lib/external-notify.js";
 import {
   configureWeatherNetwork,
   getWeatherForInject,
@@ -86,6 +87,345 @@ const summaryRevisionSessions = new Map();
 const INJECT_INTERVAL_HOURS = new Set([0.5, 1, 4, 8]);
 const MOOD_HARVEST_TERMINAL_STATUSES = new Set(["skipped", "completed"]);
 // failed 不算终态：模型被劫持/审核拒/瞬时失败后，定时器要能再试。
+// 自动整理失败后的冷却：第 1 次 10 分钟、第 2 次 30 分钟；到第 3 次直接暂停当天。
+// 冷却表只列「还能再试」的档位，暂停阈值单独设，避免出现永远轮不到的更长档。
+const AUTO_RETRY_COOLDOWN_MS = Object.freeze([
+  10 * 60 * 1000,
+  30 * 60 * 1000,
+]);
+const AUTO_RETRY_MAX_FAILURES = 3;
+const AUTO_PREFLIGHT_MAX_TOKENS = 32;
+const PARTNER_MOOD_PENDING_STATUSES = new Set(["failed", "running"]);
+
+/** 第 N 次失败后等多久再试；返回 0 表示已到暂停阈值，这一轮不再安排下一次。 */
+export function automaticRetryDelayMs(failureCount) {
+  const count = Number.isFinite(Number(failureCount)) ? Math.max(1, Math.floor(Number(failureCount))) : 1;
+  if (count >= AUTO_RETRY_MAX_FAILURES) return 0;
+  return AUTO_RETRY_COOLDOWN_MS[count - 1];
+}
+
+export function makeAutomaticRetryPatch(previous = {}, { now = new Date(), error = "" } = {}) {
+  const oldCount = Number(previous?.autoRetryCount);
+  const count = Number.isFinite(oldCount) && oldCount >= 0 ? Math.floor(oldCount) + 1 : 1;
+  const paused = count >= AUTO_RETRY_MAX_FAILURES;
+  const at = now instanceof Date ? now : new Date(now);
+  const base = Number.isNaN(at.getTime()) ? new Date() : at;
+  return {
+    autoRetryCount: count,
+    autoRetryPaused: paused,
+    autoNextRetryAt: paused ? "" : new Date(base.getTime() + automaticRetryDelayMs(count)).toISOString(),
+    autoLastFailureAt: base.toISOString(),
+    autoLastError: String(error || "").slice(0, 300),
+  };
+}
+
+export function getAutomaticRetryGate(state, now = Date.now()) {
+  const count = Number.isFinite(Number(state?.autoRetryCount))
+    ? Math.max(0, Math.floor(Number(state.autoRetryCount)))
+    : 0;
+  if (state?.autoRetryPaused === true || count >= AUTO_RETRY_MAX_FAILURES) {
+    return { blocked: true, reason: "paused", failureCount: count, nextRetryAt: "" };
+  }
+  const nextRetryAt = String(state?.autoNextRetryAt || "").trim();
+  const nextMs = nextRetryAt ? Date.parse(nextRetryAt) : NaN;
+  if (Number.isFinite(nextMs) && Number(now) < nextMs) {
+    return { blocked: true, reason: "cooldown", failureCount: count, nextRetryAt };
+  }
+  // 兼容旧状态：没有退避字段时，沿用最近一次失败/中断的十分钟保护。
+  if (!count && ["failed", "running"].includes(String(state?.status || ""))) {
+    const attemptedMs = Date.parse(String(state?.attemptedAt || ""));
+    if (Number.isFinite(attemptedMs) && Number(now) - attemptedMs < AUTO_RETRY_COOLDOWN_MS[0]) {
+      return {
+        blocked: true,
+        reason: "legacy-cooldown",
+        failureCount: 0,
+        nextRetryAt: new Date(attemptedMs + AUTO_RETRY_COOLDOWN_MS[0]).toISOString(),
+      };
+    }
+  }
+  return { blocked: false, reason: "ready", failureCount: count, nextRetryAt: "" };
+}
+
+function friendlyDayLabel(day) {
+  const raw = String(day || "").trim();
+  const matched = /^(\d{4})-(\d{2})-(\d{2})$/.exec(raw);
+  if (!matched) return raw || "上一天";
+  return `${Number(matched[2])} 月 ${Number(matched[3])} 日`;
+}
+
+/**
+ * 把自动整理的持久化状态翻成页面上能看懂的一条说明。
+ * 只说事实（失败几次、还剩几分钟重试、今天是否停摆、伙伴链是否没补完），不替用户解释原因。
+ * 返回 active:false 表示这天没有需要用户知道的事。
+ */
+export function describeAutomaticRetry(state, { day = "", partnerPending = false, now = Date.now() } = {}) {
+  const source = state && typeof state === "object" ? state : {};
+  const count = Number.isFinite(Number(source.autoRetryCount)) ? Math.max(0, Math.floor(Number(source.autoRetryCount))) : 0;
+  const paused = source.autoRetryPaused === true || count >= AUTO_RETRY_MAX_FAILURES;
+  const lastError = String(source.autoLastError || "").trim();
+  const nextMs = source.autoNextRetryAt ? Date.parse(String(source.autoNextRetryAt)) : NaN;
+  const waiting = Number.isFinite(nextMs) && nextMs > Number(now);
+  const label = friendlyDayLabel(day);
+  const reason = lastError ? `原因：${lastError}` : "";
+
+  if (!count && !paused && !waiting && !partnerPending) {
+    return { active: false, level: "idle", day, count: 0, paused: false, nextRetryAt: "", lastError: "", waitMinutes: 0, message: "" };
+  }
+  if (paused) {
+    return {
+      active: true,
+      level: "paused",
+      day,
+      count,
+      paused: true,
+      nextRetryAt: "",
+      lastError,
+      waitMinutes: 0,
+      message: `${label}的自动整理连续 ${count} 次没成功，今天不再自动重试了。${reason}`,
+    };
+  }
+  if (waiting) {
+    const waitMinutes = Math.max(1, Math.ceil((nextMs - Number(now)) / 60000));
+    return {
+      active: true,
+      level: "cooldown",
+      day,
+      count,
+      paused: false,
+      nextRetryAt: new Date(nextMs).toISOString(),
+      lastError,
+      waitMinutes,
+      message: `${label}的自动整理这次没成功，约 ${waitMinutes} 分钟后自动再试一次。${reason}`,
+    };
+  }
+  return {
+    active: true,
+    level: "pending",
+    day,
+    count,
+    paused: false,
+    nextRetryAt: "",
+    lastError,
+    waitMinutes: 0,
+    message: `${label}${partnerPending ? "还有伙伴的际遇线没整理完" : "还有没整理完的部分"}，稍后会自动再试一次。`,
+  };
+}
+
+export function canClearAutomaticSummaryAttempt(result) {
+  if (!result || result.ok !== true) return false;
+  if (result.mood?.ok === false || result.partnerMood?.ok === false) return false;
+  return !(Array.isArray(result.partnerMood?.results)
+    && result.partnerMood.results.some((item) => item && item.ok === false));
+}
+
+function automaticRunError(result) {
+  if (result?.error) return String(result.error);
+  if (result?.mood?.ok === false) return `情绪发现：${result.mood.error || "模型调用失败"}`;
+  if (result?.partnerMood?.ok === false) return `伙伴心情线：${result.partnerMood.error || "模型调用失败"}`;
+  const failedPartner = Array.isArray(result?.partnerMood?.results)
+    ? result.partnerMood.results.find((item) => item && item.ok === false)
+    : null;
+  if (failedPartner) return `伙伴心情线：${failedPartner.error || "模型调用失败"}`;
+  return "自动整理未完成";
+}
+
+function listPendingPartnerMoodStates(data, day, settings) {
+  if (!settings?.partnerMoodEnabled || normalizeMoodDiscoveryMode(settings.moodDiscoveryMode) === "off") return [];
+  const selected = getSelectedSummaryAgentIds(settings);
+  if (selected && selected.size === 0) return [];
+  const states = typeof data.listPartnerMoodHarvestStates === "function"
+    ? data.listPartnerMoodHarvestStates(day)
+    : [];
+  return states.filter((state) => PARTNER_MOOD_PENDING_STATUSES.has(String(state.status || ""))
+    && (!selected || selected.has(state.agentId)));
+}
+
+function hasPendingPartnerMood(data, day, settings) {
+  if (!settings?.partnerMoodEnabled || normalizeMoodDiscoveryMode(settings.moodDiscoveryMode) === "off") return false;
+  const selected = getSelectedSummaryAgentIds(settings);
+  if (selected && selected.size === 0) return false;
+  return data.getMoodHarvestState(day)?.partnerPending === true
+    || listPendingPartnerMoodStates(data, day, settings).length > 0;
+}
+
+function automaticRetryState(data, day, settings, state) {
+  const pending = listPendingPartnerMoodStates(data, day, settings);
+  if (!pending.length || Number(state?.autoRetryCount) > 0 || state?.autoNextRetryAt) return state;
+  const attemptedMs = pending
+    .map((item) => Date.parse(String(item.attemptedAt || "")))
+    .filter(Number.isFinite)
+    .sort((a, b) => b - a)[0];
+  return Number.isFinite(attemptedMs)
+    ? { ...(state || {}), status: "running", attemptedAt: new Date(attemptedMs).toISOString() }
+    : state;
+}
+
+function hasAutomaticFailureHistory(data, day, settings) {
+  const moodState = data.getMoodHarvestState(day);
+  return ["failed", "running"].includes(String(moodState?.status || ""))
+    || Number(moodState?.autoRetryCount) > 0
+    || moodState?.autoRetryPaused === true
+    || hasPendingPartnerMood(data, day, settings);
+}
+
+function automaticRunSettled(data, day, settings, result) {
+  if (!canClearAutomaticSummaryAttempt(result)) return false;
+  const moodEnabled = normalizeMoodDiscoveryMode(settings.moodDiscoveryMode) !== "off";
+  if (moodEnabled && !isMoodHarvestTerminal(data.getMoodHarvestState(day))) return false;
+  if (moodEnabled && hasPendingPartnerMood(data, day, settings)) return false;
+  const selected = getSelectedSummaryAgentIds(settings);
+  const summarySelectionEmpty = !!(selected && selected.size === 0);
+  const summaryReady = data.hasAgentSummary(day) && !hasStaleHanabrewSummary(day);
+  const summarySettled = result.empty === true || result.skipped === true || summaryReady
+    || !settings.autoSummary || summarySelectionEmpty;
+  return summarySettled;
+}
+
+async function recordAutomaticFailure(data, day, error, ctx = null) {
+  const previous = data.getMoodHarvestState(day) || {};
+  let next = null;
+  try {
+    next = await data.updateMoodHarvestState(day, makeAutomaticRetryPatch(previous, { error }));
+  } catch (e) {
+    logWarn(`${day} 自动重试状态保存失败：${e?.message || e}`);
+    return null;
+  }
+  notifyIfJustPaused(ctx, data, day, previous, next);
+  return next;
+}
+
+export function isPausedState(state) {
+  if (!state || typeof state !== "object") return false;
+  if (state.autoRetryPaused === true) return true;
+  const count = Number(state.autoRetryCount);
+  return Number.isFinite(count) && count >= AUTO_RETRY_MAX_FAILURES;
+}
+
+/** 这一轮失败是否「刚刚」把它推到停摆：已在停摆里再失败不算。 */
+export function isPausedTransition(previous, next) {
+  return !isPausedState(previous) && isPausedState(next);
+}
+
+/**
+ * 只在「这一轮失败把它推到停摆」的那一刻提醒一次。
+ * 已经在停摆里再失败不重复打扰；借提个醒的弹窗说，没装或被静默就安静收场
+ * （不重试、不报错——提醒是锦上添花，不能反噬整理主流程）。
+ */
+function notifyIfJustPaused(ctx, data, day, previous, next) {
+  try {
+    if (!isPausedTransition(previous, next)) return;
+    let settings = {};
+    try {
+      settings = data.getSettings ? data.getSettings() : {};
+    } catch {
+      settings = {};
+    }
+    void notifyAutoSummaryPaused({ ctx, settings, day, state: next })
+      .then((r) => {
+        if (r?.ok) logInfo(`${day} 自动整理停摆，已借提个醒弹窗告知`);
+        else if (r?.reason && r.reason !== "no-plugin") {
+          logWarn(`${day} 停摆提醒未送达：${r.reason}${r.error ? `（${r.error}）` : ""}`);
+        }
+      })
+      .catch(() => {});
+  } catch (e) {
+    logWarn(`${day} 停摆提醒派发失败：${e?.message || e}`);
+  }
+}
+
+/** 有残留就返回一份清空退避的补丁；本来就没残留时返回 null，避免无意义写盘。 */
+export function clearedAutomaticRetryPatch(state) {
+  if (!state || typeof state !== "object") return null;
+  const hasRetry = Number(state.autoRetryCount) > 0
+    || state.autoRetryPaused === true
+    || !!String(state.autoNextRetryAt || "").trim();
+  if (!hasRetry) return null;
+  return {
+    autoRetryCount: 0,
+    autoRetryPaused: false,
+    autoNextRetryAt: "",
+    autoLastFailureAt: "",
+    autoLastError: "",
+  };
+}
+
+async function clearAutomaticFailure(data, day) {
+  const patch = clearedAutomaticRetryPatch(data.getMoodHarvestState(day));
+  if (!patch) return null;
+  try {
+    return await data.updateMoodHarvestState(day, patch);
+  } catch (e) {
+    logWarn(`${day} 自动重试状态清理失败：${e?.message || e}`);
+    return null;
+  }
+}
+
+// ── 「关不掉思考」的模型档 ──
+// 部分中转/兼容端点会忽略 thinking:{type:"disabled"}，模型照思考不误：小预算全被思考吃掉、
+// 正文为空，只能靠重试给足预算救回。条件是硬证据（我们要了关闭思考，它还是想了），
+// 观测到一次就记下这一个档，之后首轮直接给足，省掉那个注定空跑的回合。
+const THINKING_UNSTOPPABLE_MAX_TOKENS = 8000;
+const THINKING_UNSTOPPABLE_FIELD = "thinkingUnstoppable";
+
+/** 当前模型档的键（provider/model）；跟随档没有具体档位，返回空串。 */
+export function currentModelKey(settings = {}) {
+  const source = String(settings?.modelSource || "agent");
+  if (source === "custom") {
+    const model = String(settings?.customModel?.model || "").trim();
+    return model ? `custom/${model}` : "";
+  }
+  if (source !== "hana") return "";
+  const providerId = String(settings?.hanaModel?.providerId || "").trim();
+  const modelId = String(settings?.hanaModel?.modelId || "").trim();
+  return providerId && modelId ? `${providerId}/${modelId}` : "";
+}
+
+/** 这个档是不是已经证实关不掉思考。 */
+export function isThinkingUnstoppable(settings = {}, key = currentModelKey(settings)) {
+  if (!key) return false;
+  return Boolean(settings?.[THINKING_UNSTOPPABLE_FIELD]?.[key]);
+}
+
+/** 按需给预算：已知关不掉的档直接给足，其他档保持原来的小预算。 */
+function summarySampleTokens(settings, baseTokens) {
+  return isThinkingUnstoppable(settings) ? THINKING_UNSTOPPABLE_MAX_TOKENS : baseTokens;
+}
+
+/** 观测到「要了关闭思考、它还是想了」就记下这一个档；同一档只写一次。 */
+async function recordThinkingUnstoppable(data, diagnostics) {
+  try {
+    if (!diagnostics?.reasoningDisabledButStillThinking) return;
+    const settings = data.getSettings();
+    const key = currentModelKey(settings);
+    if (!key || isThinkingUnstoppable(settings, key)) return;
+    await data.updateSettings({
+      [THINKING_UNSTOPPABLE_FIELD]: {
+        ...(settings[THINKING_UNSTOPPABLE_FIELD] || {}),
+        [key]: {
+          seenAt: new Date().toISOString(),
+          evidence: `hadThinking=${diagnostics.hadThinking}, finishReason=${diagnostics.finishReason || "unknown"}`,
+        },
+      },
+    });
+    logWarn(`${key} 不支持关闭思考，已记下：之后整理直接给足预算`);
+  } catch (e) {
+    logWarn(`记录关不掉思考的模型失败：${e?.message || e}`);
+  }
+}
+
+async function runAutomaticPreflight() {
+  if (!mcInstance) throw new Error("插件路由未初始化");
+  const raw = await mcInstance.sample([{ role: "user", content: "只回复 OK" }], {
+    maxTokens: AUTO_PREFLIGHT_MAX_TOKENS,
+    temperature: 0,
+    timeoutMs: 20000,
+    callPurpose: "summary-preflight",
+    reasoningLevel: "off",
+    retryOnEmpty: false,
+  });
+  if (!String(raw || "").trim()) throw new Error("自动重试前模型预检未返回可见正文");
+  return String(raw).trim();
+}
 
 // 天气失败原因 -> 页面可读的短提示。宿主白名单拦截是最常见的一种（manifest 只放行已知域名）。
 function weatherErrorHint(e) {
@@ -327,9 +667,6 @@ export default function registerRoutes(app, ctx) {
   mc.cleanupLegacyHanaCredentials().catch((error) => {
     ctx?.log?.warn?.("[拾光记] 清理旧 Hana 模型凭据失败：", error?.message || error);
   });
-
-  // 轻量定时器：每分钟检查一次是否到点该做每日总结（惰性，不依赖宿主调度器）
-  startSummaryTimer(ctx);
 
   // 待办提醒优先接入 Hana 持久化 TaskRegistry；旧宿主自动退回 30 秒补扫。
   // 调度器只负责有明确时间的未完成待办，不改助手身份文件，也不影响普通日历记录。
@@ -779,10 +1116,32 @@ export default function registerRoutes(app, ctx) {
     });
   });
 
+  // 做册状态一次拿全：后台任务进度 + 自动整理最近一次失败/退避，
+  // 让「今天没做成、正在等重试、还是已经停摆」在页面上看得见。
   app.get("/api/summaries/jobs", async (c) => {
     const data = getData();
+    const settings = data.getSettings();
+    const boundary = normalizeBoundaryHour(settings.dayBoundaryHour);
+    const targetDate = finishedLifeDayKey(new Date(), boundary);
+    const partnerPending = hasPendingPartnerMood(data, targetDate, settings);
     const jobs = data.listSummaryJobs(20).map(decorateSummaryJob);
-    return c.json({ ok: true, jobs, active: !!findActiveSummaryJob(data) });
+    const harvestState = data.getMoodHarvestState(targetDate);
+    const moodEnabled = normalizeMoodDiscoveryMode(settings.moodDiscoveryMode) !== "off";
+    // 只有整条链都落定才不提示：做册完成 + 伙伴链没挂着 + 情绪链是终态。
+    // 少了最后一条，「做册好了但情绪链没做完」这种最该告知的情况会被一起藏掉。
+    const chainSettled = data.hasSummary(targetDate)
+      && !partnerPending
+      && (!moodEnabled || isMoodHarvestTerminal(harvestState));
+    return c.json({
+      ok: true,
+      jobs,
+      active: !!findActiveSummaryJob(data),
+      targetDate,
+      autoRetry: chainSettled ? null : describeAutomaticRetry(harvestState, {
+        day: targetDate,
+        partnerPending,
+      }),
+    });
   });
 
   app.get("/api/summaries/jobs/:id", async (c) => {
@@ -814,6 +1173,7 @@ export default function registerRoutes(app, ctx) {
       const data = getData();
       const job = data.getSummaryJob(c.req.param("id"));
       if (!job) return c.json({ ok: false, error: "找不到这项后台任务" });
+      if (job.cancelledAt) return c.json({ ok: false, error: "这次重做已经取消，请重新选择日期发起" });
       const failedDates = (Array.isArray(job.outcomes) ? job.outcomes : [])
         .filter((item) => item?.status === "failed")
         .map((item) => item.date)
@@ -832,8 +1192,25 @@ export default function registerRoutes(app, ctx) {
     }
   });
 
+  // 取消这次失败重做：只收起失败任务提示，不删除已经存在的旧页面或失败记录。
+  app.post("/api/summaries/jobs/:id/cancel-retry", async (c) => {
+    try {
+      const data = getData();
+      const job = data.getSummaryJob(c.req.param("id"));
+      if (!job) return c.json({ ok: false, error: "找不到这项后台任务" });
+      if (job.cancelledAt) return c.json({ ok: true, job: decorateSummaryJob(job) });
+      if (!["completed_with_errors", "failed"].includes(job.status)) {
+        return c.json({ ok: false, error: job.status === "completed" ? "这本册子已经做好了，不需要取消重做" : "后台做册还没结束，暂时不能取消" });
+      }
+      await data.updateSummaryJob(job.id, { cancelledAt: new Date().toISOString() });
+      return c.json({ ok: true, job: decorateSummaryJob(data.getSummaryJob(job.id)) });
+    } catch (e) {
+      return c.json({ ok: false, error: e?.message || "取消重做失败" });
+    }
+  });
+
   // 确认收下这本册子：把完成提示框收掉，记到任务账本，刷新后不再弹。
-  // 只有全部做好的任务才能确认；还有失败页的任务只能重试，不能掩盖。
+  // 只有全部做好的任务才能确认；还有失败页的任务仍保留给“重新生成失败部分”。
   app.post("/api/summaries/jobs/:id/dismiss", async (c) => {
     try {
       const data = getData();
@@ -1116,6 +1493,11 @@ export default function registerRoutes(app, ctx) {
     }
   });
 
+  // 轻量定时器：每分钟检查一次是否到点该做每日总结（惰性，不依赖宿主调度器）。
+  // ⚠️ 必须放在模型列表 provider 注入之后：定时器启动时会立刻检查一次，
+  //    那时若 provider 还没注入，Hana 档会拿到空列表，启动首轮必然报“模型列表里找不到”。
+  startSummaryTimer(ctx);
+
   app.get("/api/model-config", async (c) => c.json(await mc.handleGet()));
   app.post("/api/model-config", async (c) => {
     const result = await mc.handleSave(await c.req.json().catch(() => ({})));
@@ -1198,6 +1580,21 @@ export async function runDailySummary(ctx, options = {}) {
     if (summaryRunLocks.get(lockKey) === tracked) summaryRunLocks.delete(lockKey);
   });
   summaryRunLocks.set(lockKey, tracked);
+  // 手动做册/补档跑通后也把当天残留的自动退避清掉：
+  // 否则同一天再冒出新的失败时，会先白等一次旧冷却才轮到自己。
+  if (!input.preview) {
+    tracked.then((result) => {
+      try {
+        const data = getData();
+        if (!automaticRunSettled(data, lockKey, data.getSettings(), result)) return;
+        if (!clearedAutomaticRetryPatch(data.getMoodHarvestState(lockKey))) return;
+        clearAutomaticFailure(data, lockKey);
+        summaryAttempts.delete(lockKey);
+      } catch (e) {
+        logWarn(`${lockKey} 自动退避状态清理失败：${e?.message || e}`);
+      }
+    }).catch(() => {});
+  }
   return tracked;
 }
 
@@ -1211,6 +1608,7 @@ async function runDailySummaryUnlocked(ctx, {
 } = {}) {
   const data = getData();
   const settings = data.getSettings();
+  const automatic = !manual && !preview;
   const moodMode = normalizeMoodDiscoveryMode(settings.moodDiscoveryMode);
   if (!manual && !settings.autoSummary && !(moodOnly && moodMode !== "off")) return { ok: false, error: "自动做册未开启" };
 
@@ -1244,6 +1642,7 @@ async function runDailySummaryUnlocked(ctx, {
         range,
         userName,
         force: forceMood,
+        automatic,
         messages,
         // 证据窗口在 harvestMoodForDay 内部按情绪信号感知重算，这里不必再拼整段对话。
       });
@@ -1262,17 +1661,43 @@ async function runDailySummaryUnlocked(ctx, {
   // 独立于用户情绪链与做册总结，失败不影响两者；moodOnly 场景（已有总结/全不选）也一起跑。
   let partnerMoodResults = null;
   if (!preview && settings.partnerMoodEnabled && moodMode !== "off") {
+    // 伙伴链独立于用户情绪链；先留下未完成标记，重启发生在模型调用中间时也不会丢掉待办。
     try {
-      partnerMoodResults = await harvestPartnerMoodsForDay({ day, range, userName, force: forceMood });
+      await data.updateMoodHarvestState(day, { partnerPending: true });
+    } catch (e) {
+      logWarn(`${day} 伙伴心情线待办标记保存失败：${e?.message || e}`);
+    }
+    try {
+      partnerMoodResults = await harvestPartnerMoodsForDay({ day, range, userName, force: forceMood, automatic });
+      const results = Array.isArray(partnerMoodResults?.results) ? partnerMoodResults.results : [];
+      const failed = partnerMoodResults?.ok === false || results.some((r) => r && r.ok === false);
+      try {
+        await data.updateMoodHarvestState(day, { partnerPending: failed });
+      } catch (e) {
+        logWarn(`${day} 伙伴心情线待办标记更新失败：${e?.message || e}`);
+      }
       if (partnerMoodResults?.ok && !partnerMoodResults.skipped) {
-        const finished = (partnerMoodResults.results || []).filter((r) => r.ok && !r.skipped).length;
-        logInfo(`${day} 伙伴心情线整理完成：${finished} 位伙伴`);
+        const finished = results.filter((r) => r.ok && !r.skipped).length;
+        const failedItems = results.filter((r) => r && r.ok === false);
+        if (failedItems.length) {
+          const failedIds = failedItems.map((r) => String(r.agentId || "").trim()).filter(Boolean).join("、");
+          logWarn(`${day} 伙伴心情线部分失败：${failedItems.length} 位${failedIds ? `（${failedIds}）` : ""}，已完成 ${finished} 位`);
+        } else if (finished) {
+          logInfo(`${day} 伙伴心情线整理完成：${finished} 位伙伴`);
+        } else {
+          logInfo(`${day} 伙伴心情线跳过：当天没有可处理的伙伴际遇`);
+        }
       }
     } catch (e) {
-      // 伙伴心情线是附加能力，失败不能让日子档案跟着失败。
+      // 伙伴心情线是附加能力，失败不能让日子档案跟着失败，但待办标记必须保留。
       const error = modelChannelErrorHint(e, settings.modelSource || "agent");
       logWarn(`${day} 伙伴心情线失败（不影响做册）：${error}`);
       partnerMoodResults = { ok: false, error };
+      try {
+        await data.updateMoodHarvestState(day, { partnerPending: true });
+      } catch (saveError) {
+        logWarn(`${day} 伙伴心情线失败标记保存失败：${saveError?.message || saveError}`);
+      }
     }
   }
 
@@ -1293,12 +1718,12 @@ async function runDailySummaryUnlocked(ctx, {
     : groups;
   if (!selectedGroups.length) {
     if (allAgentIds.length && selectedAgentIds) {
-      return { ok: true, empty: true, skipped: true, date: day, text: "这一天没有选中的伙伴可整理", mood: moodResult };
+      return { ok: true, empty: true, skipped: true, date: day, text: "这一天没有选中的伙伴可整理", mood: moodResult, partnerMood: partnerMoodResults };
     }
     if (!manual) {
       await data.saveSummary(day, "", { empty: true, source: "auto", boundaryHour: boundary });
     }
-    return { ok: true, empty: true, date: day, text: "这一天没有可整理的对话", mood: moodResult };
+    return { ok: true, empty: true, date: day, text: "这一天没有可整理的对话", mood: moodResult, partnerMood: partnerMoodResults };
   }
 
   if (!mcInstance) return { ok: false, error: "插件路由未初始化" };
@@ -1314,28 +1739,34 @@ async function runDailySummaryUnlocked(ctx, {
     let lastError = null;
     const evidenceBudgets = [SUMMARY_EVIDENCE_PRIMARY_CHARS, SUMMARY_EVIDENCE_FALLBACK_CHARS];
     for (let attempt = 0; attempt < evidenceBudgets.length; attempt += 1) {
+      // 自动任务的下一轮只允许由明确的上下文过大错误触发；空正文不立刻翻倍发送长证据。
+      if (attempt > 0 && automatic && !(lastError && isSummaryPromptSizeError(lastError))) break;
       const maxChars = evidenceBudgets[attempt];
       try {
         // 只有跟随档才把伙伴身份交给宿主解析工具模型；hana/custom 档都由插件直连。
         const sampleOpts = {
-          maxTokens: 500,
+          maxTokens: summarySampleTokens(data.getSettings(), 500),
           temperature: 0.4,
           timeoutMs: 60000,
           callPurpose: "summary",
           reasoningLevel: "off",
+          // 保留一次同模型空正文重试（收紧指令 + 加大 token 预算）：救回一次就省掉整轮退避；
+          // 通道真的坏掉时由日级退避兜底，不会退回分钟级重复。降级窗口不重复重试（见下方 attempt>0）。
         };
         if (summarySource === "agent") sampleOpts.agentId = modelAgentId;
-        // 首轮沿用积木已有的同模型空正文重试；若仍为空，第二轮只缩短证据，不再重复请求同一大提示词。
+        // 第二轮只缩短证据，不再重复请求同一大提示词。
         if (attempt > 0) sampleOpts.retryOnEmpty = false;
-        text = normalizeSummaryOutput(
-          await mcInstance.sample([{ role: "user", content: buildSummaryPrompt(maxChars) }], sampleOpts),
-          userName,
-        );
+        const summaryRaw = await mcInstance.sample([{ role: "user", content: buildSummaryPrompt(maxChars) }], sampleOpts);
+        await recordThinkingUnstoppable(data, mcInstance.lastDiagnostics);
+        text = normalizeSummaryOutput(summaryRaw, userName);
         if (text) {
           if (attempt > 0) logInfo(`${day} ${agentName} 做册改用紧凑证据窗口（${maxChars} 字符）后成功`);
           break;
         }
+        if (automatic) break;
       } catch (e) {
+        // 抛错这一路恰恰最需要记录：思考型通道预算不够时就是这样失败的。
+        await recordThinkingUnstoppable(data, mcInstance.lastDiagnostics);
         lastError = e;
         // 只有明确的上下文/请求体过大才值得缩短证据重试；鉴权、权限和网络故障不重复撞同一个端点。
         if (attempt === 0 && isSummaryPromptSizeError(e)) continue;
@@ -1373,7 +1804,7 @@ async function runDailySummaryUnlocked(ctx, {
   const text = generated.length === 1
     ? generated[0].text
     : generated.map((item) => `【${item.agentName}】\n${item.text}`).join("\n\n");
-  return { ok: true, text, date: day, preview, summaries: generated, mood: moodResult };
+  return { ok: true, text, date: day, preview, summaries: generated, mood: moodResult, partnerMood: partnerMoodResults };
 }
 
 function makeSummaryJobOutcome(date, result) {
@@ -1504,24 +1935,54 @@ function startSummaryTimer(ctx) {
       const summarySelectionEmpty = !!(selectedAgentIds && selectedAgentIds.size === 0);
       const day = finishedLifeDayKey(new Date(), settings.dayBoundaryHour);
       if (findActiveSummaryJob(data)) return;
+      // 当前日期正在由自动或手动入口整理时，等待这次单飞完成，不把十分钟节流误当成并发锁。
+      if (summaryRunLocks.has(day)) return;
       // 旧版混合档案不算分类总结；花酿旧随机 visitor 档案也要自动重整成逻辑角色档案。
       const summaryReady = data.hasAgentSummary(day) && !hasStaleHanabrewSummary(day);
-      const moodState = moodEnabled ? data.getMoodHarvestState(day) : null;
+      const harvestState = data.getMoodHarvestState(day);
+      const moodState = moodEnabled ? harvestState : null;
       const moodHandled = isMoodHarvestTerminal(moodState);
+      const partnerPending = moodEnabled && hasPendingPartnerMood(data, day, settings);
       const needsSummary = settings.autoSummary && !summaryReady && !summarySelectionEmpty;
-      const needsMood = moodEnabled && !moodHandled;
+      const needsMood = moodEnabled && (!moodHandled || partnerPending);
       if (!needsSummary && !needsMood) return;
+
+      const now = Date.now();
+      const retryGate = getAutomaticRetryGate(automaticRetryState(data, day, settings, harvestState), now);
+      if (retryGate.blocked) return;
       const lastAttempt = summaryAttempts.get(day) || 0;
-      if (Date.now() - lastAttempt < 10 * 60 * 1000) return;
-      summaryAttempts.set(day, Date.now());
+      if (now - lastAttempt < 10 * 60 * 1000) return;
+      summaryAttempts.set(day, now);
       logInfo(`${settings.autoSummary ? "自动总结" : "自动情绪发现"}定时器触发，目标 ${day}（边界 ${settings.dayBoundaryHour} 点）`);
-      runDailySummary(ctx, {
-        targetDate: day,
-        manual: false,
-        // 已有总结、做册伙伴全不选或自动做册关闭时，只跑独立情绪链。
-        moodOnly: !settings.autoSummary || summaryReady || summarySelectionEmpty,
-      }).then((r) => {
-        if (r.ok && !r.skipped) summaryAttempts.delete(day);
+
+      const run = async () => {
+        // 健康路径直接发正式请求；廉价预检只用于失败后的下一次自动重试。
+        if (hasAutomaticFailureHistory(data, day, settings)) {
+          try {
+            await runAutomaticPreflight();
+          } catch (e) {
+            return {
+              ok: false,
+              preflightFailed: true,
+              error: modelChannelErrorHint(e, settings.modelSource || "agent"),
+            };
+          }
+        }
+        return runDailySummary(ctx, {
+          targetDate: day,
+          manual: false,
+          // 已有总结、做册伙伴全不选或自动做册关闭时，只跑独立情绪链。
+          moodOnly: !settings.autoSummary || summaryReady || summarySelectionEmpty,
+        });
+      };
+
+      run().then(async (r) => {
+        if (automaticRunSettled(data, day, settings, r)) {
+          await clearAutomaticFailure(data, day);
+          summaryAttempts.delete(day);
+        } else {
+          await recordAutomaticFailure(data, day, automaticRunError(r), ctx);
+        }
         const msg = r.ok
           ? (r.moodOnly
             ? (r.mood?.ok === false ? `情绪发现失败：${r.mood.error || "模型调用失败"}` : (r.mood?.skipped ? "情绪发现跳过" : `已发现 ${r.mood?.autoCount || 0} 条情绪候选`))
@@ -1529,8 +1990,9 @@ function startSummaryTimer(ctx) {
           : (r.error || "未知失败");
         ctx?.log?.info?.(`[拾光记] ${day} 日子档案: ${msg}`);
         logInfo(`${day} 日子档案: ${msg}`);
-      }).catch((e) => {
+      }).catch(async (e) => {
         const errMsg = e?.message || e;
+        await recordAutomaticFailure(data, day, errMsg, ctx);
         ctx?.log?.error?.(`[拾光记] ${day} 日子档案失败: ${errMsg}`);
         logError(`${day} 日子档案失败: ${errMsg}`);
       });
@@ -1567,7 +2029,7 @@ function moodEntriesForDate(date) {
  * 日终自动情绪发现：本地预筛 → 一次带时间批量分析 →（细致档位按需）一次小型裁决。
  * 这条链路只读拾光记自己的可见消息与设置，不调用表情包插件，也不写任何伙伴身份文件。
  */
-async function harvestMoodForDay(ctx, { day, range, userName, messages = [], conversationText = "", force = false } = {}) {
+async function harvestMoodForDay(ctx, { day, range, userName, messages = [], conversationText = "", force = false, automatic = false } = {}) {
   const data = getData();
   const settings = data.getSettings();
   const mode = normalizeMoodDiscoveryMode(settings.moodDiscoveryMode);
@@ -1638,43 +2100,61 @@ async function harvestMoodForDay(ctx, { day, range, userName, messages = [], con
       : "时间不明";
     return `[${stamp}] ${row.role === "user" ? "我" : "伙伴"}：${row.text}`;
   };
-  const evidenceText = buildSignalAwareEvidence(rows, explicitSignals, fmtRow, 8000);
   // 证据校验只对“我”的原话做 substring 匹配，伙伴回复即使被模型抄进 evidence 也不能落成自动候选的证据；
   // 用户侧同样走信号感知窗口，保证模型抄回的信号原话在校验文本里找得到。
   const userRows = rows.filter((row) => row?.role === "user");
-  const userEvidenceText = buildSignalAwareEvidence(userRows, explicitSignals, fmtRow, 8000);
   const signalText = explicitSignals.length
     ? explicitSignals.map((item) => `- ${item.text}`).join("\n")
     : "（本地没有命中明确情绪词，细致档位仍可根据上下文谨慎判断）";
-  const prompt =
-    `你是拾光记里帮${userName}整理当天情绪的小花。现在生活日 ${day}（从 ${fullRange.start.toLocaleString("zh-CN")} 到 ${fullRange.end.toLocaleString("zh-CN")}）已翻篇，请根据下面的可见对话，为${userName}生成“自动发现候选”，不要把候选说成确定的心理事实。\n\n` +
-    `${userName}当天亲手记下的心情（她的亲笔，只作锚点，不能改动）：\n${entriesText || "（没有手动标记）"}\n\n` +
-    `本地零 Token 预筛命中的用户文字（只是线索，不代表最终判断）：\n${signalText}\n\n` +
-    `当天可见对话。方括号内是消息真实时间；“我”是${userName}，“伙伴”只是上下文：\n${evidenceText || "（没有可用对话文字）"}\n\n` +
-    `请只输出一个 JSON 数组，不要任何其他文字。每条候选使用以下字段：\n` +
-    `[{ "mood": "情绪词", "segment": "上午|下午|晚上", "observedAt": "从用户消息方括号原样抄回的 YYYY-MM-DD HH:MM；无法确认就填空", "certainty": "clear|possible|uncertain", "evidenceType": "explicit|context", "evidence": "从‘我’原话原样摘出的短句；无法原样找到就填空", "why": "一句带不确定语气的推测；猜不出就填空" }]\n\n` +
-    `规则：\n` +
-    `- mood 只能从这些词里选：${whitelist}；选不出来就不输出那条。\n` +
-    `- 只判断“我”这一方的情绪。伙伴说“我很开心”、系统提示、隐藏思考块都不能算${userName}的情绪。\n` +
-    `- segment 只填“上午/下午/晚上”；没有足够线索时可以填空，系统会把它记成宽泛的白天候选。\n` +
-    `- observedAt 只有在能和某条“我”的真实消息时间逐字对应时才填写，不能根据语义猜一个时间；无法对应就留空。\n` +
-    `- certainty 只能用 clear、possible、uncertain，不要输出 0-100 的心理分数。context 推测优先用 possible 或 uncertain。\n` +
-    `- evidence 必须是对话里“我”原话的连续短摘录，找不到原文就留空；why 可以为空，绝不硬安现实原因。\n` +
-    `- 她手动记过的时段不要重复输出；若同一情绪确实有旁白依据，可以输出同段同情绪来补不确定 why。没有可辨认情绪就输出 []。`;
+  const buildPrompt = (evidenceBudget) => {
+    const evidenceText = buildSignalAwareEvidence(rows, explicitSignals, fmtRow, evidenceBudget);
+    const userEvidenceText = buildSignalAwareEvidence(userRows, explicitSignals, fmtRow, evidenceBudget);
+    const prompt =
+      `你是拾光记里帮${userName}整理当天情绪的小花。现在生活日 ${day}（从 ${fullRange.start.toLocaleString("zh-CN")} 到 ${fullRange.end.toLocaleString("zh-CN")}）已翻篇，请根据下面的可见对话，为${userName}生成“自动发现候选”，不要把候选说成确定的心理事实。\n\n` +
+      `${userName}当天亲手记下的心情（她的亲笔，只作锚点，不能改动）：\n${entriesText || "（没有手动标记）"}\n\n` +
+      `本地零 Token 预筛命中的用户文字（只是线索，不代表最终判断）：\n${signalText}\n\n` +
+      `当天可见对话。方括号内是消息真实时间；“我”是${userName}，“伙伴”只是上下文：\n${evidenceText || "（没有可用对话文字）"}\n\n` +
+      `请只输出一个 JSON 数组，不要任何其他文字。每条候选使用以下字段：\n` +
+      `[{ "mood": "情绪词", "segment": "上午|下午|晚上", "observedAt": "从用户消息方括号原样抄回的 YYYY-MM-DD HH:MM；无法确认就填空", "certainty": "clear|possible|uncertain", "evidenceType": "explicit|context", "evidence": "从‘我’原话原样摘出的短句；无法原样找到就填空", "why": "一句带不确定语气的推测；猜不出就填空" }]\n\n` +
+      `规则：\n` +
+      `- mood 只能从这些词里选：${whitelist}；选不出来就不输出那条。\n` +
+      `- 只判断“我”这一方的情绪。伙伴说“我很开心”、系统提示、隐藏思考块都不能算${userName}的情绪。\n` +
+      `- segment 只填“上午/下午/晚上”；没有足够线索时可以填空，系统会把它记成宽泛的白天候选。\n` +
+      `- observedAt 只有在能和某条“我”的真实消息时间逐字对应时才填写，不能根据语义猜一个时间；无法对应就留空。\n` +
+      `- certainty 只能用 clear、possible、uncertain，不要输出 0-100 的心理分数。context 推测优先用 possible 或 uncertain。\n` +
+      `- evidence 必须是对话里“我”原话的连续短摘录，找不到原文就留空；why 可以为空，绝不硬安现实原因。\n` +
+      `- 她手动记过的时段不要重复输出；若同一情绪确实有旁白依据，可以输出同段同情绪来补不确定 why。没有可辨认情绪就输出 []。`;
+    return { prompt, userEvidenceText };
+  };
+  let promptData = buildPrompt(SUMMARY_EVIDENCE_PRIMARY_CHARS);
 
-  let raw;
-  try {
-    raw = await mcInstance.sample([{ role: "user", content: prompt }], {
-      maxTokens: 700,
-      temperature: 0.3,
-      timeoutMs: 45000,
-      callPurpose: "mood-discovery",
-      reasoningLevel: "off",
-      // 自动发现每天最多一次模型批量调用；空正文不再由积木自动重试。
-      retryOnEmpty: false,
-    });
-  } catch (e) {
-    const error = modelChannelErrorHint(e, settings.modelSource || "agent");
+  let raw = "";
+  let lastError = null;
+  for (const evidenceBudget of [SUMMARY_EVIDENCE_PRIMARY_CHARS, SUMMARY_EVIDENCE_FALLBACK_CHARS]) {
+    if (lastError && !isSummaryPromptSizeError(lastError)) break;
+    if (automatic && evidenceBudget !== SUMMARY_EVIDENCE_PRIMARY_CHARS
+      && !(lastError && isSummaryPromptSizeError(lastError))) break;
+    if (evidenceBudget !== SUMMARY_EVIDENCE_PRIMARY_CHARS) promptData = buildPrompt(evidenceBudget);
+    try {
+      raw = await mcInstance.sample([{ role: "user", content: promptData.prompt }], {
+        maxTokens: summarySampleTokens(data.getSettings(), 700),
+        temperature: 0.3,
+        timeoutMs: 45000,
+        callPurpose: "mood-discovery",
+        reasoningLevel: "off",
+        // 保留一次同模型空正文重试；通道真的坏掉时由日级退避兜底。
+      });
+      await recordThinkingUnstoppable(data, mcInstance.lastDiagnostics);
+      if (!String(raw || "").trim() && automatic) break;
+      lastError = null;
+      break;
+    } catch (e) {
+      await recordThinkingUnstoppable(data, mcInstance.lastDiagnostics);
+      lastError = e;
+    }
+  }
+  if (lastError) {
+    const error = modelChannelErrorHint(lastError, settings.modelSource || "agent");
     await saveState({ status: "failed", mode, attemptedAt, finishedAt: new Date().toISOString(), error: String(error).slice(0, 300) });
     logWarn(`${day} 自动情绪发现模型调用失败：${error}`);
     return { ok: false, error };
@@ -1693,7 +2173,7 @@ async function harvestMoodForDay(ctx, { day, range, userName, messages = [], con
     day,
     now: new Date(),
     allowedObservedAt,
-    evidenceSourceText: userEvidenceText,
+    evidenceSourceText: promptData.userEvidenceText,
   });
   let finalCandidates = candidates;
   let reviewedCandidateCount = 0;
@@ -1752,7 +2232,7 @@ async function harvestMoodForDay(ctx, { day, range, userName, messages = [], con
           timeoutMs: 30000,
           callPurpose: "mood-discovery-review",
           reasoningLevel: "off",
-          retryOnEmpty: false,
+          // 复核也沿用同模型空正文重试；失败仍保留首轮候选，不会阻断主链。
         });
         const decisions = parseMoodReviewOutput(reviewRaw, { allowedIndexes: reviewItems.map(({ index }) => index) });
         const byIndex = new Map(decisions.map((item) => [item.index, item.keep]));
@@ -1798,7 +2278,7 @@ async function harvestMoodForDay(ctx, { day, range, userName, messages = [], con
  * 只读拾光记自身可见消息；候选证据必须能锚当天原文，不外推心理事实。
  * 幂等：按 date|agentId 记录状态，重启不会重复调用；失败可随定时器在十分钟后重试。
  */
-async function harvestPartnerMoodsForDay({ day, range, userName, force = false } = {}) {
+async function harvestPartnerMoodsForDay({ day, range, userName, force = false, automatic = false } = {}) {
   const data = getData();
   const settings = data.getSettings();
   if (!settings.partnerMoodEnabled) return { ok: true, skipped: true, reason: "disabled" };
@@ -1848,6 +2328,7 @@ async function harvestPartnerMoodsForDay({ day, range, userName, force = false }
         agentId,
         moodMode,
         force,
+        automatic,
         whitelist: MOODS.map((m) => m.label).join("/"),
       }));
     } catch (e) {
@@ -1859,7 +2340,7 @@ async function harvestPartnerMoodsForDay({ day, range, userName, force = false }
   return { ok: true, results };
 }
 
-async function harvestPartnerMoodForAgent({ day, range, userName, rows, agentId, moodMode, force = false, whitelist }) {
+async function harvestPartnerMoodForAgent({ day, range, userName, rows, agentId, moodMode, force = false, automatic = false, whitelist }) {
   const data = getData();
   const partnerRows = filterPartnerRows(rows, agentId);
   const saveState = async (patch) => {
@@ -1903,37 +2384,56 @@ async function harvestPartnerMoodForAgent({ day, range, userName, rows, agentId,
       : "时间不明";
     return `[${stamp}] ${row.role === "user" ? userName : agentName}：${row.text}`;
   };
-  const evidenceText = buildSignalAwareEvidence(partnerRows, signals, fmtRow, 8000);
   const signalText = signals.length
     ? signals.map((item) => `- ${item.kind}：${item.text}`).join("\n")
     : "（本地没有命中明确际遇线索，细致档位仍可根据上下文谨慎判断）";
-  const prompt =
-    `你是拾光记的日子整理员。现在生活日 ${day}（从 ${range.start.toLocaleString("zh-CN")} 到 ${range.end.toLocaleString("zh-CN")}）已翻篇，请根据下面的可见对话，为「伙伴：${agentName}」整理当天的际遇，生成“自动发现候选”，不要把候选说成确定的心理事实。\n\n` +
-    `本地零 Token 预筛命中的际遇线索（praise=被夸被谢、rebuke=被凶被嫌、self=它自己表达了感受；只是线索，不代表最终判断）：\n${signalText}\n\n` +
-    `当天可见对话（只含 ${agentName} 与 ${userName} 的往来；方括号内是消息真实时间；“我”是 ${userName}）：\n${evidenceText || "（没有可用对话文字）"}\n\n` +
-    `请只输出一个 JSON 数组，不要任何其他文字。每条候选使用以下字段：\n` +
-    `[{ "mood": "情绪词", "segment": "上午|下午|晚上", "observedAt": "从消息方括号原样抄回的 YYYY-MM-DD HH:MM；无法确认就填空", "certainty": "clear|possible|uncertain", "evidenceType": "explicit|context", "evidence": "从对话原样摘出的短句；无法原样找到就填空", "why": "一句带不确定语气的推测，写清是哪种际遇（被夸/被谢/被凶/被晾/被需要/它自己表达了感受）；猜不出就填空" }]\n\n` +
-    `规则：\n` +
-    `- mood 只能从这些词里选：${whitelist}；选不出来就不输出那条。\n` +
-    `- 只判断“${agentName}”这一方的感受，且依据只能是它那天的际遇：被夸、被谢、被凶、被晾、被需要，或它自己明确说出的感受。\n` +
-    `- 它的服务性回应不算情绪：它安抚${userName}、说“我理解你”“别担心”这类共情话，不能推出它自己难过或担心。\n` +
-    `- segment 只填“上午/下午/晚上”；没有足够线索时可以填空，系统会把它记成宽泛的白天候选。\n` +
-    `- observedAt 只有在能和某条真实消息时间逐字对应时才填写，不能根据语义猜一个时间；无法对应就留空。\n` +
-    `- certainty 只能用 clear、possible、uncertain，不要输出 0-100 的心理分数。context 推测优先用 possible 或 uncertain。\n` +
-    `- evidence 必须是对话里的连续短摘录（“我”夸它/凶它的话，或它自己的原话都行），找不到原文就留空；why 可以为空，绝不硬安现实原因。\n` +
-    `- 没有可辨认际遇就输出 []，宁可少不要硬凑。`;
-  let raw;
-  try {
-    raw = await mcInstance.sample([{ role: "user", content: prompt }], {
-      maxTokens: 700,
-      temperature: 0.3,
-      timeoutMs: 45000,
-      callPurpose: "partner-mood-discovery",
-      reasoningLevel: "off",
-      retryOnEmpty: false,
-    });
-  } catch (e) {
-    const error = modelChannelErrorHint(e, data.getSettings().modelSource || "agent");
+  const buildPrompt = (evidenceBudget) => {
+    const evidenceText = buildSignalAwareEvidence(partnerRows, signals, fmtRow, evidenceBudget);
+    const prompt =
+      `你是拾光记的日子整理员。现在生活日 ${day}（从 ${range.start.toLocaleString("zh-CN")} 到 ${range.end.toLocaleString("zh-CN")}）已翻篇，请根据下面的可见对话，为「伙伴：${agentName}」整理当天的际遇，生成“自动发现候选”，不要把候选说成确定的心理事实。\n\n` +
+      `本地零 Token 预筛命中的际遇线索（praise=被夸被谢、rebuke=被凶被嫌、self=它自己表达了感受；只是线索，不代表最终判断）：\n${signalText}\n\n` +
+      `当天可见对话（只含 ${agentName} 与 ${userName} 的往来；方括号内是消息真实时间；“我”是 ${userName}）：\n${evidenceText || "（没有可用对话文字）"}\n\n` +
+      `请只输出一个 JSON 数组，不要任何其他文字。每条候选使用以下字段：\n` +
+      `[{ "mood": "情绪词", "segment": "上午|下午|晚上", "observedAt": "从消息方括号原样抄回的 YYYY-MM-DD HH:MM；无法确认就填空", "certainty": "clear|possible|uncertain", "evidenceType": "explicit|context", "evidence": "从对话原样摘出的短句；无法原样找到就填空", "why": "一句带不确定语气的推测，写清是哪种际遇（被夸/被谢/被凶/被晾/被需要/它自己表达了感受）；猜不出就填空" }]\n\n` +
+      `规则：\n` +
+      `- mood 只能从这些词里选：${whitelist}；选不出来就不输出那条。\n` +
+      `- 只判断“${agentName}”这一方的感受，且依据只能是它那天的际遇：被夸、被谢、被凶、被晾、被需要，或它自己明确说出的感受。\n` +
+      `- 它的服务性回应不算情绪：它安抚${userName}、说“我理解你”“别担心”这类共情话，不能推出它自己难过或担心。\n` +
+      `- segment 只填“上午/下午/晚上”；没有足够线索时可以填空，系统会把它记成宽泛的白天候选。\n` +
+      `- observedAt 只有在能和某条真实消息时间逐字对应时才填写，不能根据语义猜一个时间；无法对应就留空。\n` +
+      `- certainty 只能用 clear、possible、uncertain，不要输出 0-100 的心理分数。context 推测优先用 possible 或 uncertain。\n` +
+      `- evidence 必须是对话里的连续短摘录（“我”夸它/凶它的话，或它自己的原话都行），找不到原文就留空；why 可以为空，绝不硬安现实原因。\n` +
+      `- 没有可辨认际遇就输出 []，宁可少不要硬凑。`;
+    return { prompt, evidenceText };
+  };
+  let promptData = buildPrompt(SUMMARY_EVIDENCE_PRIMARY_CHARS);
+  let raw = "";
+  let lastError = null;
+  for (const evidenceBudget of [SUMMARY_EVIDENCE_PRIMARY_CHARS, SUMMARY_EVIDENCE_FALLBACK_CHARS]) {
+    if (lastError && !isSummaryPromptSizeError(lastError)) break;
+    if (automatic && evidenceBudget !== SUMMARY_EVIDENCE_PRIMARY_CHARS
+      && !(lastError && isSummaryPromptSizeError(lastError))) break;
+    if (evidenceBudget !== SUMMARY_EVIDENCE_PRIMARY_CHARS) promptData = buildPrompt(evidenceBudget);
+    try {
+      raw = await mcInstance.sample([{ role: "user", content: promptData.prompt }], {
+        maxTokens: summarySampleTokens(data.getSettings(), 700),
+        temperature: 0.3,
+        timeoutMs: 45000,
+        callPurpose: "partner-mood-discovery",
+        reasoningLevel: "off",
+        // 保留一次同模型空正文重试；通道真的坏掉时由日级退避兜底。
+      });
+      await recordThinkingUnstoppable(data, mcInstance.lastDiagnostics);
+      if (!String(raw || "").trim() && automatic) break;
+      lastError = null;
+      break;
+    } catch (e) {
+      await recordThinkingUnstoppable(data, mcInstance.lastDiagnostics);
+      lastError = e;
+    }
+  }
+  if (lastError) {
+    const error = modelChannelErrorHint(lastError, data.getSettings().modelSource || "agent");
     await saveState({ status: "failed", moodMode, attemptedAt, finishedAt: new Date().toISOString(), error: String(error).slice(0, 300) });
     return { ok: false, error, agentId };
   }
@@ -1947,7 +2447,7 @@ async function harvestPartnerMoodForAgent({ day, range, userName, rows, agentId,
     day,
     now: new Date(),
     allowedObservedAt,
-    evidenceSourceText: evidenceText,
+    evidenceSourceText: promptData.evidenceText,
   });
   // 伙伴链没有手动亲笔；当天自动走严格口径（同段同情绪去重，只留能站住的候选）；
   // 历史补档（force=true）走宽松口径：同段不同情绪允许共存，一天的情绪起伏不被砍平。

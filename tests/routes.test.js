@@ -1296,11 +1296,16 @@ test("时光册：入口与日历多选控件统一使用做册文案", async ()
   assert.match(script, /retrySummaryJobFailed/);
   assert.match(script, /retry-failed/);
   assert.match(script, /summary-job-failed-item/);
+  assert.match(script, /取消重做/);
+  assert.match(script, /function cancelSummaryJobRetry/);
+  assert.match(script, /cancel-retry/);
+  assert.match(script, /summary-job-cancel-btn/);
   assert.match(script, /runSummaryFromDay\([^)]*, this\)/);
   assert.match(script, /id="detail-summary-msg"/);
   assert.match(script, /'<\/div><\/div><span class="sum-msg" id="detail-summary-msg"><\/span><\/div>'/);
   assert.match(script, /markSummaryTriggerPending/);
   assert.match(script, /正在放到后台/);
+  assert.match(script, /var pendingText = values\.length > 1 \? '正在把这几页放到后台…' : '正在把这一页放到后台…'/);
   assert.match(script, /正在把失败的部分放回后台/);
   assert.match(script, /trigger\.disabled = true/);
   // 确认收下：完成的册子显示「知道了」，确认后从列表过滤
@@ -1556,6 +1561,61 @@ test("路由：确认完成只允许全部做好的任务，确认后不再展�
   assert.equal(result.status, 0, result.stderr || result.stdout);
   assert.match(result.stdout, /"rejected":"[^"]*重新生成/);
   assert.match(result.stdout, /"dismissedAt":true/);
+});
+
+test("路由：失败任务可以取消重做提示，但保留失败记录", () => {
+  const isolatedHome = fs.mkdtempSync(path.join(os.tmpdir(), "sgj-cancel-retry-test-"));
+  const routeUrl = pathToFileURL(path.resolve("routes/ui.js")).href;
+  const dataUrl = pathToFileURL(path.resolve("lib/data.js")).href;
+  const sdUrl = pathToFileURL(path.resolve("lib/shared-data.js")).href;
+  const childCode = `
+    import path from "node:path";
+    import os from "node:os";
+    import fs from "node:fs";
+    import { UserData } from ${JSON.stringify(dataUrl)};
+    import { __setSharedUserDataForTest } from ${JSON.stringify(sdUrl)};
+    import registerRoutes from ${JSON.stringify(routeUrl)};
+    const home = path.join(os.homedir(), ".hanako");
+    fs.mkdirSync(path.join(home, "agents"), { recursive: true });
+    fs.writeFileSync(path.join(home, "users.json"), JSON.stringify({ displayName: "小测试" }));
+    const data = new UserData(path.join(home, "plugin-data", "shiguangji"));
+    __setSharedUserDataForTest(data);
+    const routes = [];
+    const app = {
+      get(p, h) { routes.push({ method: "GET", path: p, handler: h }); },
+      post(p, h) { routes.push({ method: "POST", path: p, handler: h }); },
+      put(p, h) { routes.push({ method: "PUT", path: p, handler: h }); },
+      delete(p, h) { routes.push({ method: "DELETE", path: p, handler: h }); },
+    };
+    registerRoutes(app, { log: { info() {}, warn() {}, error() {} } });
+    await data.createSummaryJob({
+      id: "err-job",
+      dates: ["2026-08-27"],
+      outcomes: [{ date: "2026-08-27", status: "failed", error: "没有可见正文" }],
+      status: "completed_with_errors",
+      currentDate: "",
+      error: "1 页没有做好，可以重新发起",
+      createdAt: new Date().toISOString(),
+    });
+    const cancel = routes.find((r) => r.method === "POST" && r.path === "/api/summaries/jobs/:id/cancel-retry");
+    if (!cancel) throw new Error("cancel-retry 路由未注册");
+    const result = await cancel.handler({ req: { param(n) { return n === "id" ? "err-job" : ""; } }, json(v) { return v; } });
+    if (!result.ok || !result.job.cancelledAt) throw new Error("失败任务取消失败：" + JSON.stringify(result));
+    const stored = data.getSummaryJob("err-job");
+    if (!stored.cancelledAt || stored.outcomes[0].status !== "failed") throw new Error("取消不应删除或改写失败记录：" + JSON.stringify(stored));
+    if (data.listSummaryJobs(50).some((job) => job.id === "err-job")) throw new Error("取消后的任务不应继续展示");
+    const retry = routes.find((r) => r.method === "POST" && r.path === "/api/summaries/jobs/:id/retry-failed");
+    const retryResult = await retry.handler({ req: { param(n) { return n === "id" ? "err-job" : ""; } }, json(v) { return v; } });
+    if (retryResult.ok || !retryResult.error.includes("已经取消")) throw new Error("取消后不应继续重做：" + JSON.stringify(retryResult));
+    console.log(JSON.stringify({ cancelled: !!stored.cancelledAt, visible: data.listSummaryJobs(50).length, retryError: retryResult.error }));
+  `;
+  const result = spawnSync(process.execPath, ["--input-type=module", "-e", childCode], {
+    encoding: "utf8",
+    env: { ...process.env, USERPROFILE: isolatedHome, HOME: isolatedHome, HANA_HOME: path.join(isolatedHome, ".hanako") },
+  });
+  assert.equal(result.status, 0, result.stderr || result.stdout);
+  assert.match(result.stdout, /"cancelled":true/);
+  assert.match(result.stdout, /已经取消/);
 });
 
 test("列表：原任务已终态并确认收下时，旧版重试残留不再展示", () => {
