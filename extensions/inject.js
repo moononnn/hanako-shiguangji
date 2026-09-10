@@ -7,11 +7,17 @@ import os from "node:os";
 import path from "node:path";
 import { filterDueTodos } from "../lib/data.js";
 import { configureSharedUserData, getSharedUserData } from "../lib/shared-data.js";
-import { InjectionTracker, shouldInject, buildInjectionText } from "../lib/inject.js";
+import {
+  InjectionTracker,
+  shouldInject,
+  buildInjectionText,
+  decideWeatherMention,
+  weatherFactKey,
+} from "../lib/inject.js";
 import { selectRecentSummaries } from "../lib/recent-summaries.js";
 import { getBuiltinFestivals, isWorkday } from "../lib/festivals.js";
 import { FESTIVAL_HINTS, pickFestivalHint } from "../lib/festival-hints.js";
-import { finishedLifeDayKey, resolveSummaryAgentId } from "../lib/day-summary.js";
+import { finishedLifeDayKey, lifeDayKey, resolveSummaryAgentId } from "../lib/day-summary.js";
 import { readHanaUserName } from "../lib/user-name.js";
 import {
   getConfiguredWeatherFetcher,
@@ -32,7 +38,7 @@ export function __setInjectNowForTest(provider) {
   nowProvider = provider || (() => new Date());
 }
 
-// 模拟进程重启：清空内存 tracker，但盘上状态（deepseekPeak store）保留，供重启恢复类测试使用。
+// 模拟进程重启：清空内存 tracker，但盘上注入状态和 deepseekPeak 状态保留，供重启恢复类测试使用。
 export function __clearInjectTrackersForTest() {
   tracker.sessions.clear();
 }
@@ -43,6 +49,12 @@ export function __resetLazySummaryForTest() {
 
 function contextDataDir(context) {
   return context?.dataDir || context?.pluginContext?.dataDir || context?.ctx?.dataDir || null;
+}
+
+// 情境状态异步落盘（fire-and-forget，失败静默不影响对话）。
+function persistInjectionState(data, sessionId, state) {
+  if (!data || !sessionId || !state) return;
+  data.setInjectionState(sessionId, state).catch(() => {});
 }
 
 // 峰谷判定状态异步落盘（fire-and-forget，复用 EncryptedStore 串行写队列，失败静默不影响对话）。
@@ -78,24 +90,30 @@ export default function registerShiguangjiInject(pi) {
       const settings = data.getSettings();
       const now = nowProvider();
       const injectionEnabled = settings.injectionEnabled !== false;
-      let lastState = tracker.get(sessionId);
-      if (!lastState) {
-        // 重启后内存 tracker 已清空：从盘上恢复该会话的峰谷判定状态。
-        // 这样「重启后的旧窗口」仍记得上次的 dsActive/dsPreviewKeys，不会被误判成新窗口重复播报当前时段。
-        const diskDs = data.getDeepSeekPeakState(sessionId);
-        if (diskDs) lastState = { ...diskDs };
-      }
       const currentModel = resolveCurrentModel(event, ctx);
       const dataRev = data.getDataRev();
-      const contextKey = JSON.stringify({
-        mode: settings.injectMode || "balanced",
-        intervalHours: settings.injectIntervalHours || 4,
-        boundaryHour: settings.dayBoundaryHour,
-        showPeriod: settings.showPeriod !== false,
-        summaryShared: settings.summaryShared === true,
-        weatherEnabled: settings.weatherEnabled !== false,
-        weatherLocation: settings.weatherLocation || "",
-      });
+      const contextKey = buildInjectionContextKey(settings);
+      const trackedState = tracker.get(sessionId);
+      const storedInjectionState = trackedState || data.getInjectionState(sessionId);
+      const diskDs = data.getDeepSeekPeakState(sessionId);
+      const legacyRecovery = !storedInjectionState && !!diskDs;
+      // 普通注入状态与 DeepSeek 峰谷状态是两套 schema，不能互相冒充。
+      // 没有完整注入状态的旧版本，只用当前时刻建立一次保守冷却，避免升级/重启首轮重复刷屏。
+      let lastState = storedInjectionState;
+      if (!lastState && legacyRecovery) {
+        lastState = {
+          lastInjectAt: now.getTime(),
+          lastDateKey: lifeDayKey(now, settings.dayBoundaryHour),
+          lastHash: "",
+          contextKey,
+          lastDataRev: dataRev,
+          injectionEnabled: true,
+        };
+      }
+      const deepseekLastState = storedInjectionState || diskDs || null;
+      if (lastState && lastState.contextKey !== contextKey) {
+        logContextKeyChange(sessionId, lastState.contextKey, contextKey);
+      }
 
       // 关闭只阻断助手情境，不读取日子/总结，也不影响日历与时光册。
       if (!injectionEnabled) {
@@ -110,19 +128,23 @@ export default function registerShiguangjiInject(pi) {
           contextKey,
           injectionEnabled: false,
         });
-        tracker.set(sessionId, {
+        const disabledState = {
           ...disabledDecision.newState,
           contextKey,
           lastDataRev: dataRev,
           injectionEnabled: false,
-        });
+        };
+        tracker.set(sessionId, disabledState);
+        if (!trackedState || trackedState.injectionEnabled !== false) {
+          persistInjectionState(data, sessionId, disabledState);
+        }
         return undefined;
       }
 
       const deepseekDecision = decideDeepSeekNotice({
         model: currentModel,
         now,
-        lastState,
+        lastState: deepseekLastState,
       });
 
       // 收集当天情境。预计中的生理期不作为确定事实注入。
@@ -197,7 +219,15 @@ export default function registerShiguangjiInject(pi) {
       };
       const deepseekForced = deepseekDecision.should;
       if (!decision.should && !deepseekForced) {
+        if (legacyRecovery) {
+          const legacyWeather = readFreshWeather(data, settings, now);
+          if (legacyWeather) {
+            decisionState.weatherLastMentionAt = now.getTime();
+            decisionState.weatherLastFactKey = weatherFactKey(legacyWeather);
+          }
+        }
         tracker.set(sessionId, decisionState);
+        if (legacyRecovery) persistInjectionState(data, sessionId, decisionState);
         persistDeepSeekState(data, sessionId, deepseekDecision.state);
         return undefined;
       }
@@ -223,20 +253,23 @@ export default function registerShiguangjiInject(pi) {
         prompt: extractPrompt(event),
       });
 
-      // 天气：同步读缓存（刷新由定时器后台做，不阻塞注入）；没配置/没缓存就 null
-      let weather = null;
-      try {
-        const wc = data.getWeatherCache();
-        if (
-          settings.weatherEnabled !== false &&
-          weatherCacheMatches(wc, settings) &&
-          weatherCacheIsFresh(wc, settings, now)
-        ) {
-          weather = normalizeWeatherResult(wc.result);
-        }
-      } catch {
-        weather = null;
+      // 天气：同步读缓存（刷新由定时器后台做，不阻塞注入）；没配置/没缓存就 null。
+      const weather = readFreshWeather(data, settings, now);
+      let weatherDecision = decideWeatherMention({ weather, lastState, now });
+      // 旧版本只落盘 DeepSeek 状态，无法知道上次天气事实；升级后的第一次恢复保守跳过天气，避免立刻重复刷屏。
+      if (legacyRecovery && weather && !storedInjectionState) {
+        lastState = {
+          ...lastState,
+          weatherLastMentionAt: now.getTime(),
+          weatherLastFactKey: weatherDecision.factKey,
+        };
+        weatherDecision = { ...weatherDecision, should: false };
       }
+      if (weatherDecision.should || (legacyRecovery && weather && weatherDecision.factKey)) {
+        decisionState.weatherLastMentionAt = now.getTime();
+        decisionState.weatherLastFactKey = weatherDecision.factKey;
+      }
+      const weatherForInjection = weatherDecision.should ? weather : null;
 
       const text = buildInjectionText({
         now,
@@ -253,7 +286,7 @@ export default function registerShiguangjiInject(pi) {
           proactiveDate: finishedLifeDayKey(now, settings.dayBoundaryHour),
           userName,
         },
-        weather,
+        weather: weatherForInjection,
         deepseekNotice: deepseekDecision.notice,
         includeTime: settings.injectMode !== "economical",
         force: decision.reason === "new-session" || decision.reason === "day-changed" || decision.reason === "injection-enabled",
@@ -263,6 +296,7 @@ export default function registerShiguangjiInject(pi) {
 
       if (!text) {
         tracker.set(sessionId, decisionState);
+        persistInjectionState(data, sessionId, decisionState);
         persistDeepSeekState(data, sessionId, deepseekDecision.state);
         return undefined;
       }
@@ -281,11 +315,15 @@ export default function registerShiguangjiInject(pi) {
       // 内容 hash 去重：同一会话同一内容不重复注入
       const hash = crypto.createHash("sha1").update(text).digest("hex");
       if (lastState && lastState.lastHash === hash && !deepseekForced && decision.reason !== "day-changed" && decision.reason !== "settings-changed" && decision.reason !== "injection-enabled") {
-        tracker.set(sessionId, { ...decisionState, lastHash });
+        const dedupedState = { ...decisionState, lastHash };
+        tracker.set(sessionId, dedupedState);
+        persistInjectionState(data, sessionId, dedupedState);
         return undefined;
       }
 
-      tracker.set(sessionId, { ...decisionState, lastHash: hash });
+      const finalState = { ...decisionState, lastHash: hash };
+      tracker.set(sessionId, finalState);
+      persistInjectionState(data, sessionId, finalState);
       persistDeepSeekState(data, sessionId, deepseekDecision.state);
 
       return {
@@ -307,6 +345,53 @@ export default function registerShiguangjiInject(pi) {
       return undefined;
     }
   });
+}
+
+function buildInjectionContextKey(settings = {}) {
+  return JSON.stringify({
+    mode: settings.injectMode || "balanced",
+    intervalHours: settings.injectIntervalHours || 4,
+    boundaryHour: settings.dayBoundaryHour,
+    showPeriod: settings.showPeriod !== false,
+    summaryShared: settings.summaryShared === true,
+    weatherEnabled: settings.weatherEnabled !== false,
+    weatherLocation: settings.weatherLocation || "",
+  });
+}
+
+function parseContextKey(value) {
+  try {
+    const parsed = JSON.parse(String(value || ""));
+    return parsed && typeof parsed === "object" ? parsed : { value };
+  } catch {
+    return { value: String(value || "") };
+  }
+}
+
+function logContextKeyChange(sessionId, previousKey, nextKey) {
+  const previous = parseContextKey(previousKey);
+  const next = parseContextKey(nextKey);
+  const fields = [...new Set([...Object.keys(previous), ...Object.keys(next)])]
+    .filter((key) => JSON.stringify(previous[key]) !== JSON.stringify(next[key]));
+  if (!fields.length) return;
+  logInfo(`情境注入设置指纹变化 session=${sessionId} fields=${fields.join(",")} old=${JSON.stringify(previous)} new=${JSON.stringify(next)}`);
+}
+
+function readFreshWeather(data, settings, now) {
+  try {
+    const cache = data.getWeatherCache();
+    if (
+      settings.weatherEnabled !== false &&
+      weatherCacheMatches(cache, settings) &&
+      weatherCacheIsFresh(cache, settings, now)
+    ) {
+      const normalized = normalizeWeatherResult(cache.result);
+      return normalized ? { ...normalized, place: normalized.place || cache.location || "" } : null;
+    }
+  } catch {
+    // 天气读取失败时继续注入其他情境。
+  }
+  return null;
 }
 
 function getAgentsDir() {
