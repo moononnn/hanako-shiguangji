@@ -477,6 +477,10 @@ test("注入文本：DeepSeek 峰谷关照要求闲聊也硬带一句", () => {
   assert.ok(text.includes("5 分钟后"), text);
   assert.ok(text.includes("谷时段"), text);
   assert.ok(text.includes("哪怕当前只是闲聊也要自然带出一句"), text);
+  // 同一聊天框同一时段只说一次：注入只发一次，但模型容易把时段当意象反复用，文案里要显式收口。
+  assert.ok(text.includes("只在本次回复里提这一次"), text);
+  assert.ok(text.includes("不要再主动提起"), text);
+  assert.ok(text.includes("只有真的再次换班才再说"), text);
   assert.ok(text.includes("小满"), text);
   assert.ok(text.includes("模型峰谷关照属于硬触发"), text);
   assert.ok(text.includes("峰时/谷时只表示模型费用时段和是否划算"), text);
@@ -493,6 +497,7 @@ test("注入文本：DeepSeek 峰谷关照要求闲聊也硬带一句", () => {
     },
   });
   assert.ok(enteredText.includes("已经进入谷时段"), enteredText);
+  assert.ok(enteredText.includes("只在本次回复里提这一次"), enteredText);
   assert.ok(!enteredText.includes("刚刚已经进入"), enteredText);
 
   const toneTexts = [0, 1, 2].map((toneIndex) => buildInjectionText({

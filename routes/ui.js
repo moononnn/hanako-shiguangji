@@ -1024,6 +1024,15 @@ export default function registerRoutes(app, ctx) {
     });
   });
 
+  // ── 周期规律：生理期的历史周期、汇总与下次预计 ──
+  app.get("/api/period-pattern", async (c) => {
+    const data = getData();
+    const settings = data.getSettings();
+    // 关掉生理期功能的用户不暴露这块数据
+    if (settings.showPeriod === false) return c.json({ ok: true, hidden: true });
+    return c.json({ ok: true, pattern: data.periodPattern() });
+  });
+
   // ── 注入配置 ──
   app.get("/api/settings", async (c) => {
     const s = getData().getSettings();
