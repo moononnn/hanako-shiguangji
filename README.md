@@ -25,7 +25,6 @@
 
 它一头连着日历，一头连着对话：你可以在页面里记下一天发生了什么，小花也会在恰当的时候感知到今天的时间、窗外的天气和你正在惦记的事情。一天结束以后，还能把这一天收成一页时光册，慢慢翻回去看。
 
-![拾光记首页：今日概览、天气和日历](attachments/shiguangji-home.png)
 
 ## 它能做什么
 
@@ -176,4 +175,5 @@ Get-ChildItem -Recurse -Filter *.js | ForEach-Object { node --check $_.FullName 
 ## 署名
 
 **moononnn & 小花**
+
 
