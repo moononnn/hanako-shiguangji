@@ -16,6 +16,7 @@ import {
   MOODS,
   buildSignalAwareEvidence,
   findExplicitMoodSignals,
+  findExplicitMoodSelfReports,
   normalizeMoodCertainty,
   normalizeMoodEvidenceType,
   normalizeMoodId,
@@ -27,6 +28,7 @@ import {
   makeManualMood,
   makeAutoMood,
   parseMoodOutput,
+  parseMoodOutputWithDiagnostics,
   mergeMoodEntries,
   moodEntryText,
   formatMoodTimeline,
@@ -80,6 +82,18 @@ test("自动发现本地预筛：只看用户消息，不让伙伴回复单独�
   assert.equal(signals.length, 1);
   assert.equal(signals[0].ts, 2);
   assert.match(signals[0].text, /焦虑/);
+});
+
+test("自动发现：明确自述可单独识别，普通语气词不直接落情绪", () => {
+  const reports = findExplicitMoodSelfReports([
+    { role: "user", ts: 1, text: "我今天真的很开心，终于跑通了" },
+    { role: "user", ts: 2, text: "哈哈绝了，继续搞" },
+    { role: "user", ts: 3, text: "我觉得你很开心" },
+  ]);
+  assert.equal(reports.length, 1);
+  assert.equal(reports[0].mood, "happy");
+  assert.equal(reports[0].evidence, "我今天真的很开心");
+  assert.equal(reports[0].certainty, "clear");
 });
 
 test("自动发现字段归一：宽时段、无数字置信度", () => {
@@ -149,6 +163,34 @@ test("parseMoodOutput：普通数组 / json 围栏 / 带废话都能解析", () 
   assert.deepEqual(parseMoodOutput(""), []);
   assert.deepEqual(parseMoodOutput("模型没说人话"), []);
   assert.deepEqual(parseMoodOutput('[{"mood":"随便","segment":"x"}]'), []);
+});
+
+test("parseMoodOutput 诊断：只统计结构，不记录模型原文", () => {
+  const result = parseMoodOutputWithDiagnostics('```json\n[{"mood":"开心","segment":"下午","evidence":"我好开心"},{"mood":"不存在","segment":"晚上"},{"mood":"累","segment":"晚上","evidence":"不在原文"}]\n```', {
+    evidenceSourceText: "[2026-09-15 15:00] 我：我好开心",
+  });
+  assert.deepEqual(result.diagnostics, {
+    rawEmpty: false,
+    fenced: true,
+    hasJsonArray: true,
+    jsonValid: true,
+    array: true,
+    object: false,
+    rawItemCount: 3,
+    objectItemCount: 3,
+    invalidMoodCount: 1,
+    acceptedCount: 2,
+    exactTimeCount: 0,
+    evidenceProvidedCount: 2,
+    evidenceMatchedCount: 1,
+  });
+  assert.equal(result.entries.length, 2);
+  assert.equal(Object.prototype.hasOwnProperty.call(result.diagnostics, "raw"), false);
+
+  const single = parseMoodOutputWithDiagnostics('{"mood":"感动","segment":"晚上","certainty":"possible"}');
+  assert.equal(single.entries.length, 1, "伙伴链的单候选对象也应能解析");
+  assert.equal(single.diagnostics.object, true);
+  assert.equal(single.diagnostics.rawItemCount, 1);
 });
 
 test("parseMoodOutput：只接受真实消息分钟，并保留证据与不确定性", () => {

@@ -12,6 +12,7 @@ import { spawnSync } from "node:child_process";
 import { pathToFileURL } from "node:url";
 import { UserData } from "../lib/data.js";
 import {
+  buildPartnerFallbackMood,
   findPartnerFortuneSignals,
   hasPartnerFortuneSignal,
   filterPartnerRows,
@@ -38,6 +39,32 @@ test("际遇预筛：指向伙伴的负面（rebuke）命中", () => {
   assert.equal(signals[0].kind, "rebuke");
 });
 
+test("际遇预筛：否定句和反向表达不误触发情绪信号", () => {
+  const rows = [
+    mk(1000, "assistant", "hanako", "我不开心，也不担心你"),
+    mk(2000, "user", "hanako", "我不喜欢你，也不满意这个结果"),
+    mk(3000, "user", "hanako", "你不是不行，我只是想让你再检查一遍"),
+    mk(4000, "user", "hanako", "你不讨厌我吧，我也不想让你难过"),
+    mk(5000, "assistant", "hanako", "我不想让你开心，我希望你先冷静"),
+  ];
+  assert.deepEqual(findPartnerFortuneSignals(rows, "hanako"), []);
+  assert.equal(buildPartnerFallbackMood([{ ts: 1000, kind: "self", text: "我不开心" }]), null);
+  assert.equal(buildPartnerFallbackMood([{ ts: 1000, kind: "praise", text: "我不喜欢你" }]), null);
+});
+
+test("际遇预筛：混合句保留未被否定的正向与自述片段", () => {
+  const rows = [
+    mk(1000, "user", "hanako", "我不太喜欢你，但谢谢你帮我解决了问题"),
+    mk(2000, "user", "hanako", "我不是很满意这个结果，不过你真的很靠谱"),
+    mk(3000, "user", "hanako", "我不爱你，但这个方案绝了"),
+    mk(4000, "assistant", "hanako", "我不是不开心，我是特别开心"),
+  ];
+  const signals = findPartnerFortuneSignals(rows, "hanako");
+  assert.equal(signals.filter((item) => item.kind === "praise").length, 3);
+  assert.equal(signals.filter((item) => item.kind === "self").length, 1);
+  assert.equal(buildPartnerFallbackMood([{ ts: 1000, kind: "praise", text: "我不太喜欢你，但谢谢你" }]).mood, "moved");
+});
+
 test("际遇预筛：伙伴显式表达（self）认「我」主语的感受", () => {
   const rows = [
     mk(1000, "assistant", "hanako", "我有点担心你最近睡太晚了"),
@@ -59,6 +86,19 @@ test("际遇预筛：其他伙伴的消息不掺和进目标伙伴的际遇", ()
   assert.ok(forHanako.length === 1 && forHanako[0].kind === "praise");
   assert.equal(hasPartnerFortuneSignal(rows, "other"), true, "其他伙伴自己的线也该有信号");
   assert.equal(hasPartnerFortuneSignal(rows, "absent"), false, "没出现的伙伴无信号");
+});
+
+test("伙伴兜底：强际遇只生成一条可能的候选并保留原话证据", () => {
+  const candidate = buildPartnerFallbackMood([
+    { ts: new Date("2026-09-15T12:34:00+08:00").getTime(), kind: "praise", text: "小花你太棒了，谢谢你！" },
+    { ts: new Date("2026-09-15T12:35:00+08:00").getTime(), kind: "praise", text: "这个也做得好" },
+  ], { now: new Date("2026-09-16T00:00:00+08:00") });
+  assert.ok(candidate);
+  assert.equal(candidate.mood, "moved");
+  assert.equal(candidate.certainty, "possible");
+  assert.equal(candidate.evidenceType, "explicit");
+  assert.equal(candidate.evidence, "小花你太棒了，谢谢你！");
+  assert.equal(candidate.timePrecision, "turn");
 });
 
 test("际遇预筛：空输入/无 agentId 返回空", () => {

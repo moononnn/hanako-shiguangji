@@ -1804,6 +1804,12 @@ test("布局：宽窗口日历适度放大并保留两侧留白", async () => {
   assert.doesNotMatch(html, /max-width: 760px; margin: 0 auto;/);
 });
 
+test("布局：做册进度卡与上下内容保持同宽", async () => {
+  const { renderPage } = await import("../lib/page-template.js");
+  const html = renderPage("test-token");
+  assert.match(html, /\.summary-jobs \{[\s\S]*max-width: 980px; margin: 0 auto 16px;/);
+});
+
 test("布局：待办增多不撑高日历格，完整内容留在详情面板", async () => {
   const { renderPage } = await import("../lib/page-template.js");
   const html = renderPage("test-token");

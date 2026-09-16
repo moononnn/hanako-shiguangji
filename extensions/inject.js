@@ -29,10 +29,38 @@ import {
 } from "../lib/weather.js";
 import { configureDebugLog, logInfo, logWarn } from "../lib/debug-log.js";
 import { decideDeepSeekNotice } from "../lib/deepseek-peak.js";
+import { schedulePublicToday } from "../lib/public-today.js";
 
 const tracker = new InjectionTracker();
 let weatherTimer = null; // 天气惰性刷新定时器
 let nowProvider = () => new Date(); // 可覆写的时钟（测试用），生产保持真实当前时间
+
+// 对外快照（public-today.json）的刷新刻度：只在数据版本或生活日变过之后才排一次。
+// 内容没变时写盘会被 writePublicToday 自己跳过，所以这里不必精细判重。
+const snapshotMark = { rev: null, day: "" };
+
+function refreshPublicTodayNow({ dataDir, data, settings, now = new Date() } = {}) {
+  if (!dataDir || !data || !settings) return;
+  try {
+    schedulePublicToday({ dataDir, data, settings, now });
+  } catch {
+    // 对外快照刷新失败不影响主流程
+  }
+}
+
+function maybeRefreshPublicToday({ dataDir, data, settings, now, dataRev }) {
+  if (!dataDir || !data || !settings) return;
+  let day = "";
+  try {
+    day = lifeDayKey(now, settings.dayBoundaryHour);
+  } catch {
+    day = "";
+  }
+  if (snapshotMark.rev === dataRev && snapshotMark.day === day) return;
+  snapshotMark.rev = dataRev;
+  snapshotMark.day = day;
+  refreshPublicTodayNow({ dataDir, data, settings, now });
+}
 
 export function __setInjectNowForTest(provider) {
   nowProvider = provider || (() => new Date());
@@ -79,7 +107,14 @@ export default function registerShiguangjiInject(pi) {
     configureDebugLog(dataDir);
   }
   // 天气惰性刷新：每 15 分钟检查一次缓存是否过期，过期就后台查（不阻塞注入）
-  startWeatherRefresher();
+  startWeatherRefresher(dataDir);
+  // 对外快照：启动先摆一份，之后由数据变动 / 跨天 / 天气刷新去抖刷新
+  try {
+    const bootData = getData();
+    refreshPublicTodayNow({ dataDir, data: bootData, settings: bootData.getSettings() });
+  } catch {
+    // 启动写快照失败不影响插件加载
+  }
 
   pi.on("before_agent_start", (event, ctx) => {
     try {
@@ -92,6 +127,15 @@ export default function registerShiguangjiInject(pi) {
       const injectionEnabled = settings.injectionEnabled !== false;
       const currentModel = resolveCurrentModel(event, ctx);
       const dataRev = data.getDataRev();
+      // 对外快照独立于「情境注入」开关：那个开关只管往 Hana 会话里注入，
+      // 这份快照是给别的消费方读的，关掉注入也照常维护。
+      maybeRefreshPublicToday({
+        dataDir: dataDir || contextDataDir(ctx),
+        data,
+        settings,
+        now,
+        dataRev,
+      });
       const contextKey = buildInjectionContextKey(settings);
       const trackedState = tracker.get(sessionId);
       const storedInjectionState = trackedState || data.getInjectionState(sessionId);
@@ -445,7 +489,7 @@ export function resolveAgentId(event, ctx) {
 // ── 天气惰性刷新 ──
 // 每 15 分钟检查一次：配置了居住地 + 缓存过期 → 后台查一次天气写缓存。
 // 注入只同步读缓存，刷新永不阻塞对话。
-function startWeatherRefresher() {
+function startWeatherRefresher(dataDir = null) {
   if (weatherTimer) return; // 防重复
   const check = () => {
     try {
@@ -473,6 +517,13 @@ function startWeatherRefresher() {
         .then((r) => {
           if (r) {
             logInfo(`天气已刷新：${r.place} · ${r.line}`);
+            // 新天气落地了，对外快照跟着换一份
+            try {
+              const refreshed = getData();
+              refreshPublicTodayNow({ dataDir, data: refreshed, settings: refreshed.getSettings() });
+            } catch {
+              // 天气刷新成功但快照失败，不影响下一次注入
+            }
           }
         })
         .catch(() => {});

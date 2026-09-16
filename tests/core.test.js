@@ -1578,6 +1578,8 @@ test("总结清洗：剥离隐藏块与拾光记注入", () => {
   assert.equal(sanitizeVisibleText("正文<UpdateVariable><JSONPatch>[]</JSONPatch></UpdateVariable>尾巴"), "正文 尾巴");
   assert.equal(isSyntheticSummaryText("[来自 Agent「小花」的消息，非用户本人] 测试"), true);
   assert.equal(isSyntheticSummaryText("[SessionFile] {fileId: 'x'}"), true);
+  assert.equal(isSyntheticSummaryText("[hana_context] - 今日时光：2026-09-15"), true);
+  assert.equal(isSyntheticSummaryText("[hana_reference] biaoqingbao 工具说明"), true);
   assert.equal(isSyntheticSummaryText("用户发送‘小花’测试消息，验证其是否能显示在沈叙会话中。"), true);
 });
 

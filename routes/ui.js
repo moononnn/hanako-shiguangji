@@ -49,18 +49,21 @@ import {
   MOODS,
   buildSignalAwareEvidence,
   findExplicitMoodSignals,
+  findExplicitMoodSelfReports,
+  makeAutoMood,
   makeManualMood,
   mergeMoodEntries,
   moodById,
   normalizeMoodId,
-  parseMoodOutput,
+  parseMoodOutputWithDiagnostics,
   parseMoodReviewOutput,
   pickDayMood,
   segmentLabel,
   segmentOfHour,
+  segmentOfTimestamp,
 } from "../lib/mood.js";
 import { readHanaUserName } from "../lib/user-name.js";
-import { findPartnerFortuneSignals, filterPartnerRows } from "../lib/partner-mood.js";
+import { buildPartnerFallbackMood, findPartnerFortuneSignals, filterPartnerRows } from "../lib/partner-mood.js";
 import { moodLineSegmentForEntry, moodLineSegmentLabelForEntry } from "../lib/mood-line.js";
 import { TodoReminderScheduler } from "../lib/todo-reminder-scheduler.js";
 import { configureDebugLog, logInfo, logWarn, logError } from "../lib/debug-log.js";
@@ -2068,6 +2071,21 @@ async function harvestMoodForDay(ctx, { day, range, userName, messages = [], con
   const fullRange = moodMessages && moodMessages.range && moodMessages.range.start ? moodMessages.range : range;
   const manual = data.listManualMoods(day);
   const explicitSignals = findExplicitMoodSignals(rows);
+  const explicitReports = findExplicitMoodSelfReports(rows);
+  const directCandidates = explicitReports.map((report) => {
+    const observedAt = Number.isFinite(Number(report.ts)) ? new Date(Number(report.ts)).toISOString() : "";
+    return makeAutoMood({
+      mood: report.mood,
+      segment: observedAt ? segmentOfTimestamp(observedAt) : "day",
+      certainty: report.certainty,
+      evidenceType: "explicit",
+      evidence: report.evidence,
+      observedAt,
+      timePrecision: observedAt ? "turn" : "segment",
+      note: "来自用户原话的直接自述",
+      now: new Date(),
+    });
+  }).filter(Boolean);
   const saveState = async (patch) => {
     try {
       return await data.updateMoodHarvestState(day, patch);
@@ -2128,6 +2146,8 @@ async function harvestMoodForDay(ctx, { day, range, userName, messages = [], con
       `规则：\n` +
       `- mood 只能从这些词里选：${whitelist}；选不出来就不输出那条。\n` +
       `- 只判断“我”这一方的情绪。伙伴说“我很开心”、系统提示、隐藏思考块都不能算${userName}的情绪。\n` +
+      `- 如果“我”的原话直接说出这些情绪（例如“我很开心”“我好累”“我很焦虑”），应按 explicit 候选保留；不要因为它只是聊天语气就全部输出空数组。\n` +
+      `- 没有直接自述时，才谨慎根据上下文推测，并使用 possible 或 uncertain；上下文不够就不输出。\n` +
       `- segment 只填“上午/下午/晚上”；没有足够线索时可以填空，系统会把它记成宽泛的白天候选。\n` +
       `- observedAt 只有在能和某条“我”的真实消息时间逐字对应时才填写，不能根据语义猜一个时间；无法对应就留空。\n` +
       `- certainty 只能用 clear、possible、uncertain，不要输出 0-100 的心理分数。context 推测优先用 possible 或 uncertain。\n` +
@@ -2178,12 +2198,15 @@ async function harvestMoodForDay(ctx, { day, range, userName, messages = [], con
   const allowedObservedAt = rows
     .filter((row) => row?.role === "user" && Number.isFinite(Number(row.ts)))
     .map((row) => row.ts);
-  const candidates = parseMoodOutput(raw, {
+  const parsedMood = parseMoodOutputWithDiagnostics(raw, {
     day,
     now: new Date(),
     allowedObservedAt,
     evidenceSourceText: promptData.userEvidenceText,
   });
+  const candidates = parsedMood.entries;
+  const parseDiag = parsedMood.diagnostics;
+  logInfo(`${day} 用户情绪回包诊断：空=${parseDiag.rawEmpty ? "是" : "否"} 围栏=${parseDiag.fenced ? "是" : "否"} 数组=${parseDiag.array ? "是" : "否"} 原始条目=${parseDiag.rawItemCount} 对象=${parseDiag.objectItemCount} 无效情绪=${parseDiag.invalidMoodCount} 接受=${parseDiag.acceptedCount} 本地明确自述=${explicitReports.length} 精确时刻=${parseDiag.exactTimeCount} 证据匹配=${parseDiag.evidenceMatchedCount}/${parseDiag.evidenceProvidedCount}`);
   let finalCandidates = candidates;
   let reviewedCandidateCount = 0;
   let reviewedCount = 0;
@@ -2257,7 +2280,7 @@ async function harvestMoodForDay(ctx, { day, range, userName, messages = [], con
   }
 
   // force=true（历史补档）宽松合并：同段不同情绪共存；当天自动严格，保持原口径。
-  const merged = mergeMoodEntries(manual, finalCandidates, { lenient: force });
+  const merged = mergeMoodEntries(manual, [...directCandidates, ...finalCandidates], { lenient: force });
   if (JSON.stringify(merged) !== JSON.stringify(manual)) await data.replaceDayMoods(day, merged);
   const retainedAutoCount = merged.filter((entry) => entry.source === "auto").length;
   await saveState({
@@ -2452,16 +2475,22 @@ async function harvestPartnerMoodForAgent({ day, range, userName, rows, agentId,
     return { ok: false, error, agentId };
   }
   const allowedObservedAt = partnerRows.filter((row) => Number.isFinite(Number(row.ts))).map((row) => row.ts);
-  const candidates = parseMoodOutput(raw, {
+  const parsedMood = parseMoodOutputWithDiagnostics(raw, {
     day,
     now: new Date(),
     allowedObservedAt,
     evidenceSourceText: promptData.evidenceText,
   });
+  const modelCandidates = parsedMood.entries;
+  const fallbackCandidate = modelCandidates.length ? null : buildPartnerFallbackMood(signals);
+  const candidates = fallbackCandidate ? [fallbackCandidate] : modelCandidates;
+  const parseDiag = parsedMood.diagnostics;
+  logInfo(`${day} 伙伴情绪回包诊断（${agentId}）：空=${parseDiag.rawEmpty ? "是" : "否"} 围栏=${parseDiag.fenced ? "是" : "否"} 数组=${parseDiag.array ? "是" : "否"} 对象=${parseDiag.object ? "是" : "否"} 原始条目=${parseDiag.rawItemCount} 对象条目=${parseDiag.objectItemCount} 无效情绪=${parseDiag.invalidMoodCount} 模型接受=${parseDiag.acceptedCount} 兜底=${fallbackCandidate ? "是" : "否"} 精确时刻=${parseDiag.exactTimeCount} 证据匹配=${parseDiag.evidenceMatchedCount}/${parseDiag.evidenceProvidedCount}`);
   // 伙伴链没有手动亲笔；当天自动走严格口径（同段同情绪去重，只留能站住的候选）；
   // 历史补档（force=true）走宽松口径：同段不同情绪允许共存，一天的情绪起伏不被砍平。
   const merged = mergeMoodEntries([], candidates, { lenient: !!force });
-  if (merged.length) await data.replacePartnerDayMoods(day, agentId, merged);
+  // 本次成功整理出的空结果也要写回，清掉旧候选，避免重跑后残留过期心情。
+  await data.replacePartnerDayMoods(day, agentId, merged);
   await saveState({
     status: "completed",
     moodMode,
@@ -2472,7 +2501,7 @@ async function harvestPartnerMoodForAgent({ day, range, userName, rows, agentId,
     messageCount: partnerRows.length,
     explicitSignalCount: signals.length,
   });
-  return { ok: true, agentId, agentName, candidateCount: candidates.length, autoCount: merged.length };
+  return { ok: true, agentId, agentName, candidateCount: candidates.length, modelCandidateCount: modelCandidates.length, fallbackCount: fallbackCandidate ? 1 : 0, autoCount: merged.length };
 }
 
 // ── 伙伴心情历史补档（后台任务：只补际遇线，不碰做册总结）──
