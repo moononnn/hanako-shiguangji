@@ -40,9 +40,10 @@ let nowProvider = () => new Date(); // 可覆写的时钟（测试用），生�
 const snapshotMark = { rev: null, day: "" };
 
 function refreshPublicTodayNow({ dataDir, data, settings, now = new Date() } = {}) {
-  if (!dataDir || !data || !settings) return;
+  const dir = dataDir || data?.dataDir || null;
+  if (!dir || !data || !settings) return;
   try {
-    schedulePublicToday({ dataDir, data, settings, now });
+    schedulePublicToday({ dataDir: dir, data, settings, now });
   } catch {
     // 对外快照刷新失败不影响主流程
   }
@@ -79,6 +80,18 @@ function contextDataDir(context) {
   return context?.dataDir || context?.pluginContext?.dataDir || context?.ctx?.dataDir || null;
 }
 
+// 宿主门面有时不给扩展工厂传 dataDir；这时回退到共享数据实例自己的目录。
+// 少了这一步，依赖 dataDir 的对外快照会静默不写（聊天类 App 那侧于是永远读不到）。
+function resolveExtensionDataDir(pi) {
+  const fromContext = contextDataDir(pi);
+  if (fromContext) return fromContext;
+  try {
+    return getSharedUserData()?.dataDir || null;
+  } catch {
+    return null;
+  }
+}
+
 // 情境状态异步落盘（fire-and-forget，失败静默不影响对话）。
 function persistInjectionState(data, sessionId, state) {
   if (!data || !sessionId || !state) return;
@@ -101,7 +114,7 @@ function getData(context = null) {
 }
 
 export default function registerShiguangjiInject(pi) {
-  const dataDir = contextDataDir(pi);
+  const dataDir = resolveExtensionDataDir(pi);
   if (dataDir) {
     configureSharedUserData(dataDir);
     configureDebugLog(dataDir);

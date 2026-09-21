@@ -314,6 +314,16 @@ test("DeepSeek：北京时间峰谷和五分钟前预告窗口", () => {
   assert.equal(weekend.isWeekend, true);
   assert.equal(weekend.period, "valley");
   assert.equal(weekend.nextBoundary, null);
+
+  const adjustedWeekend = getDeepSeekTimeInfo(new Date("2026-09-20T10:00:00+08:00"));
+  assert.equal(adjustedWeekend.isWeekend, true);
+  assert.equal(adjustedWeekend.period, "valley", "调休上班的周末仍按全天谷价，不恢复工作日峰谷");
+  assert.equal(adjustedWeekend.nextBoundary, null);
+
+  const legalHoliday = getDeepSeekTimeInfo(new Date("2026-09-25T10:00:00+08:00"));
+  assert.equal(legalHoliday.isLegalHoliday, true);
+  assert.equal(legalHoliday.period, "valley", "法定节假日即使落在周五也按全天谷价");
+  assert.equal(legalHoliday.nextBoundary, null);
 });
 
 test("DeepSeek：首次识别、提前预告和错过预告后的补报只各触发一次", () => {
