@@ -496,6 +496,12 @@ test("注入文本：DeepSeek 峰谷关照要求闲聊也硬带一句", () => {
   assert.ok(text.includes("峰时/谷时只表示模型费用时段和是否划算"), text);
   assert.ok(text.includes("不要把它解释成交通拥堵"), text);
   assert.ok(text.includes("所有可见表达只围绕费用和聊天成本"), text);
+  // 区间定义必须随注入给出：模型被追问依据时才有可引用的规则，不会翻出早已失效的旧错峰时段。
+  assert.ok(text.includes("09:00-12:00") && text.includes("14:00-18:00"), text);
+  assert.ok(text.includes("其余时间为低谷时段"), text);
+  assert.ok(text.includes("周末和法定节假日全天按低谷计费"), text);
+  assert.ok(text.includes("不要凭记忆补充旧版错峰时段"), text);
+  assert.ok(!text.includes("00:30"), text);
 
   const enteredText = buildInjectionText({
     now: new Date("2026-09-08T08:30:00+08:00"),
@@ -508,6 +514,7 @@ test("注入文本：DeepSeek 峰谷关照要求闲聊也硬带一句", () => {
   });
   assert.ok(enteredText.includes("已经进入谷时段"), enteredText);
   assert.ok(enteredText.includes("只在本次回复里提这一次"), enteredText);
+  assert.ok(enteredText.includes("09:00-12:00"), enteredText);
   assert.ok(!enteredText.includes("刚刚已经进入"), enteredText);
 
   const toneTexts = [0, 1, 2].map((toneIndex) => buildInjectionText({
