@@ -502,6 +502,10 @@ test("注入文本：DeepSeek 峰谷关照要求闲聊也硬带一句", () => {
   assert.ok(text.includes("周末和法定节假日全天按低谷计费"), text);
   assert.ok(text.includes("不要凭记忆补充旧版错峰时段"), text);
   assert.ok(!text.includes("00:30"), text);
+  // 事实边界句挂在情境块末尾，覆盖所有分支和所有事实块：范围外的事要承认不知道。
+  assert.ok(text.includes("上面这些是你手上关于今天和"), text);
+  assert.ok(text.includes("你并不知道"), text);
+  assert.ok(text.includes("不要顺着猜"), text);
 
   const enteredText = buildInjectionText({
     now: new Date("2026-09-08T08:30:00+08:00"),
