@@ -38,6 +38,9 @@ test("通用红线非空且包含关键约束", () => {
   assert.ok(FESTIVAL_GUIDELINES.includes("不预设她的处境"));
   assert.ok(FESTIVAL_GUIDELINES.includes("求共享"));
   assert.ok(FESTIVAL_GUIDELINES.includes("不追问"));
+  assert.ok(FESTIVAL_GUIDELINES.includes("不把未来写成已经发生"));
+  assert.ok(FESTIVAL_GUIDELINES.includes("白天不能说已经看见月亮"));
+  assert.ok(!FESTIVAL_GUIDELINES.includes("先假设自己完整地看到了月亮"));
 });
 
 // ── pick 随机不重复 ──
@@ -93,10 +96,43 @@ test("注入文本：带节日引导时，在「今天是」后插入【节日�
   assert.ok(text.includes("今天是：中秋节🌕"));
   assert.ok(text.includes("【节日氛围】今天是中秋节。我这边月亮很圆。"));
   assert.ok(text.includes("【节日通用分寸】"));
+  assert.ok(text.includes("【节日问候要求】"));
+  assert.ok(text.includes("闲聊、打招呼或分享日常"));
+  assert.ok(text.includes("回复至少有两层：先自然表达中秋节祝福"));
+  assert.ok(text.includes("把本条节日氛围里的具体意象转成一句像自己在分享的感受"));
+  assert.ok(text.includes("不能只说“中秋节快乐”"));
+  assert.ok(text.includes("天气和普通寒暄只能点缀，不能代替节日氛围"));
+  assert.ok(text.includes("若对方正在问正事或请求帮助"));
+  assert.ok(text.includes("只有先前已经同时表达祝福和具体节日意象，才算问候过"));
+  assert.ok(text.includes("若之前只说了节日名称或一句“中秋节快乐”，下次合适的闲聊里补上具体节日分享"));
   // 氛围行在「今天是」行之后
   const todayIdx = text.indexOf("今天是：");
   const hintIdx = text.indexOf("【节日氛围】");
   assert.ok(hintIdx > todayIdx, "节日氛围应在今天是行之后");
+});
+
+test("节日时序：下午禁止把夜色和赏月写成已经发生，提供当前时刻", () => {
+  const text = buildInjectionText({
+    now: new Date(2026, 8, 25, 16, 19, 0),
+    builtinFestivals: [{ name: "中秋节", emoji: "🌕" }],
+    force: true,
+    festivalHint: { name: "中秋节", text: "今晚的夜色慢慢安静下来。", index: 0, nextUsed: [0] },
+  });
+  assert.ok(text.includes("【节日时序】当前本地时间是 16:19，按白天处理"));
+  assert.ok(text.includes("不得说已经入夜、已经看见月亮/星星、夜色或路灯亮起"));
+  assert.ok(text.includes("今晚相关内容只能用将来或条件语气"));
+});
+
+test("节日时序：晚间也不能无依据声称月亮可见", () => {
+  const text = buildInjectionText({
+    now: new Date(2026, 8, 25, 20, 10, 0),
+    builtinFestivals: [{ name: "中秋节", emoji: "🌕" }],
+    force: true,
+    festivalHint: { name: "中秋节", text: "夜色很美。", index: 0, nextUsed: [0] },
+  });
+  assert.ok(text.includes("【节日时序】当前本地时间是 20:10"));
+  assert.ok(text.includes("不能只凭时刻断言此刻已天黑或月亮可见"));
+  assert.ok(text.includes("除非天气或用户明确提供依据"));
 });
 
 test("注入文本：无节日引导时不出现【节日氛围】", () => {

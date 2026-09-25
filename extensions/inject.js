@@ -254,6 +254,7 @@ export default function registerShiguangjiInject(pi) {
         intervalHours: settings.injectIntervalHours,
         lastState,
         hasSpecialDay,
+        hasFestivalGreeting: builtin.some((f) => !!FESTIVAL_HINTS[f.name]),
         dayBoundaryHour: settings.dayBoundaryHour,
         contextKey,
         injectionEnabled: true,
@@ -371,7 +372,7 @@ export default function registerShiguangjiInject(pi) {
 
       // 内容 hash 去重：同一会话同一内容不重复注入
       const hash = crypto.createHash("sha1").update(text).digest("hex");
-      if (lastState && lastState.lastHash === hash && !deepseekForced && decision.reason !== "day-changed" && decision.reason !== "settings-changed" && decision.reason !== "injection-enabled") {
+      if (lastState && lastState.lastHash === hash && !deepseekForced && decision.reason !== "day-changed" && decision.reason !== "settings-changed" && decision.reason !== "injection-enabled" && decision.reason !== "festival-greeting") {
         const dedupedState = { ...decisionState, lastHash };
         tracker.set(sessionId, dedupedState);
         persistInjectionState(data, sessionId, dedupedState);

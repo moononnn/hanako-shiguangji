@@ -2,9 +2,9 @@
 
 > 给 Hana 里的每一天，留一页可以回看的光。
 
-当前版本：`0.2.131`
+当前版本：`0.2.133`
 
-当前版本最近一次自动测试结果：全量自动测试 350/350 通过；66 个 JavaScript 文件 `node --check` 通过。
+当前版本最近一次自动测试结果：全量自动测试 353/353 通过；仓库内 66 个 JavaScript 源文件 `node --check` 通过，发布包内 45 个 JavaScript 文件通过语法检查。
 
 ## ⚠️ 先说清楚
 
@@ -158,7 +158,7 @@
 Get-ChildItem -Recurse -Filter *.js | ForEach-Object { node --check $_.FullName }
 ```
 
-当前版本最近一次自动测试结果：全量自动测试 350/350 通过；66 个 JavaScript 文件 `node --check` 通过。
+当前版本最近一次自动测试结果：全量自动测试 353/353 通过；仓库内 66 个 JavaScript 源文件 `node --check` 通过，发布包内 45 个 JavaScript 文件通过语法检查。
 
 ## 致谢
 
