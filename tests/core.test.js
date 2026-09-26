@@ -21,7 +21,7 @@ import {
   weatherFactKey,
 } from "../lib/inject.js";
 import { decideDeepSeekNotice, getDeepSeekTimeInfo, isDeepSeekModel } from "../lib/deepseek-peak.js";
-import { getBuiltinFestivals, isWorkday, getMonthFestivals } from "../lib/festivals.js";
+import { getBuiltinFestivals, isWorkday, isLegalHoliday, getMonthFestivals } from "../lib/festivals.js";
 import {
   UserData,
   dateKey,
@@ -1017,6 +1017,40 @@ test("节假日：同名节日不重复（法定+农历双源去重）", () => {
     const count = f.filter((x) => x.name === name).length;
     assert.equal(count, 1, `${name}（${dk}）应只出现一次，实际 ${count} 次：${JSON.stringify(f)}`);
   }
+});
+
+test("节假日：假期区间不等于节日当天（中秋假期第 2/3 天不再报节日）", () => {
+  const first = getBuiltinFestivals(new Date(2026, 8, 25));
+  const firstHits = first.filter((x) => x.name === "中秋节");
+  assert.equal(firstHits.length, 1, `9-25 应报一次中秋节：${JSON.stringify(first)}`);
+  assert.equal(firstHits[0].emoji, "🌕", "正日子用节日自己的 emoji，不应该是假期 emoji");
+
+  for (const day of [26, 27]) {
+    const f = getBuiltinFestivals(new Date(2026, 8, day));
+    assert.equal(f.filter((x) => x.name === "中秋节").length, 0, `9-${day} 不应报中秋节：${JSON.stringify(f)}`);
+    assert.ok(f.some((x) => x.name === "中秋节假期"), `9-${day} 应报中秋节假期：${JSON.stringify(f)}`);
+  }
+});
+
+test("节假日：春节/国庆同理，只有正日子报节日名", () => {
+  assert.ok(getBuiltinFestivals(new Date(2026, 1, 17)).some((x) => x.name === "春节"));
+  assert.ok(getBuiltinFestivals(new Date(2026, 1, 22)).some((x) => x.name === "春节假期"));
+  assert.ok(getBuiltinFestivals(new Date(2026, 9, 1)).some((x) => x.name === "国庆节"));
+  assert.ok(getBuiltinFestivals(new Date(2026, 9, 5)).some((x) => x.name === "国庆节假期"));
+});
+
+test("节假日：2026 年放假与调休按国务院通知（国办发明电〔2025〕7 号）", () => {
+  // 假期区间：元旦 1/1-1/3、春节 2/15-2/23、端午 6/19-6/21、国庆 10/1-10/7
+  for (const [m, d] of [[1, 3], [2, 23], [6, 21], [10, 7]]) {
+    assert.equal(isLegalHoliday(new Date(2026, m - 1, d)), true, `2026-${m}-${d} 应在假期内`);
+  }
+  assert.equal(isLegalHoliday(new Date(2026, 9, 8)), false, "10-8 不在假期内");
+  assert.equal(isLegalHoliday(new Date(2026, 0, 2)), true, "1-2 应在元旦假期内");
+  // 调休上班日：1/4、2/14、2/28、5/9、9/20、10/10
+  for (const [m, d] of [[1, 4], [2, 14], [2, 28], [5, 9], [9, 20], [10, 10]]) {
+    assert.equal(isWorkday(new Date(2026, m - 1, d)), true, `2026-${m}-${d} 应为调休上班日`);
+  }
+  assert.equal(isWorkday(new Date(2026, 8, 26)), false, "9-26 假期内不算上班日");
 });
 
 // ── 数据层 ──
