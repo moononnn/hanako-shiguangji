@@ -5,13 +5,20 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { mkdtempSync } from "node:fs";
-import { FESTIVAL_GUIDELINES, FESTIVAL_HINTS, pickFestivalHint } from "../lib/festival-hints.js";
+import { FESTIVAL_GUIDELINES, FESTIVAL_HINTS, pickFestivalHint, didMentionFestival } from "../lib/festival-hints.js";
 import { buildInjectionText } from "../lib/inject.js";
 import { UserData } from "../lib/data.js";
 
 function tmpDir(name) {
   return mkdtempSync(path.join(os.tmpdir(), `shiguangji-${name}-`));
 }
+
+test("节日问候完成检测：只认助手可见正文中的节日意象，不认 MOOD", () => {
+  assert.equal(didMentionFestival("中秋快乐，桂花香想起来就很清甜。", "中秋节"), true);
+  assert.equal(didMentionFestival("<mood>中秋快乐</mood>报错原因已经查清了。", "中秋节"), false);
+  assert.equal(didMentionFestival("这份报错原因已经查清了。", "中秋节"), false);
+  assert.equal(didMentionFestival("圣诞树很好看。", "中秋节"), false);
+});
 
 // ── 引导表完整性 ──
 test("节日引导表：12 个节日都有引导池，每池 5-8 个变体", () => {
@@ -91,20 +98,21 @@ test("注入文本：带节日引导时，在「今天是」后插入【节日�
     now: new Date(2026, 8, 25, 20, 0, 0),
     builtinFestivals: [{ name: "中秋节", emoji: "🌕" }],
     force: true,
+    recentSummaryOptions: { userName: "小满" },
     festivalHint: { name: "中秋节", text: "我这边月亮很圆。", index: 0, nextUsed: [0] },
   });
   assert.ok(text.includes("今天是：中秋节🌕"));
   assert.ok(text.includes("【节日氛围】今天是中秋节。我这边月亮很圆。"));
   assert.ok(text.includes("【节日通用分寸】"));
   assert.ok(text.includes("【节日问候要求】"));
-  assert.ok(text.includes("闲聊、打招呼或分享日常"));
-  assert.ok(text.includes("回复至少有两层：先自然表达中秋节祝福"));
-  assert.ok(text.includes("把本条节日氛围里的具体意象转成一句像自己在分享的感受"));
-  assert.ok(text.includes("不能只说“中秋节快乐”"));
-  assert.ok(text.includes("天气和普通寒暄只能点缀，不能代替节日氛围"));
-  assert.ok(text.includes("若对方正在问正事或请求帮助"));
-  assert.ok(text.includes("只有先前已经同时表达祝福和具体节日意象，才算问候过"));
-  assert.ok(text.includes("若之前只说了节日名称或一句“中秋节快乐”，下次合适的闲聊里补上具体节日分享"));
+  assert.ok(text.includes("本聊天框里自然提到一次中秋节就够"));
+  assert.ok(text.includes("先看对话历史"));
+  assert.ok(text.includes("如果小满已经收到过你的节日祝福或节日意象，就算完成"));
+  assert.ok(text.includes("先回应她当前的话题"));
+  assert.ok(text.includes("在答完后轻轻带一句祝福和一个具体意象"));
+  assert.ok(text.includes("不要抢过正题"));
+  assert.ok(text.includes("不要主动重复节日问候"));
+  assert.ok(text.includes("只有小满主动继续聊节日时，再顺着她的话题回应"));
   // 氛围行在「今天是」行之后
   const todayIdx = text.indexOf("今天是：");
   const hintIdx = text.indexOf("【节日氛围】");
@@ -132,7 +140,24 @@ test("节日时序：晚间也不能无依据声称月亮可见", () => {
   });
   assert.ok(text.includes("【节日时序】当前本地时间是 20:10"));
   assert.ok(text.includes("不能只凭时刻断言此刻已天黑或月亮可见"));
-  assert.ok(text.includes("除非天气或用户明确提供依据"));
+  assert.ok(text.includes("除非天气或当前对话里明确提供依据"));
+});
+
+test("注入文本：节日称呼跟着用户配置走，不写死具体名字", () => {
+  const make = (userName) => buildInjectionText({
+    now: new Date(2026, 8, 25, 20, 0, 0),
+    builtinFestivals: [{ name: "中秋节", emoji: "🌕" }],
+    force: true,
+    recentSummaryOptions: { userName },
+    festivalHint: { name: "中秋节", text: "我这边月亮很圆。", index: 0, nextUsed: [0] },
+  });
+  const a = make("小满");
+  const b = make("阿澈");
+  assert.ok(a.includes("如果小满已经收到过") && a.includes("只有小满主动继续聊节日"));
+  assert.ok(b.includes("如果阿澈已经收到过") && b.includes("只有阿澈主动继续聊节日"));
+  assert.ok(!a.includes("阿澈") && !b.includes("小满"), "两个名字互不残留");
+  // 未配置用户名时走中性回退
+  assert.ok(make("").includes("如果对方已经收到过"));
 });
 
 test("注入文本：无节日引导时不出现【节日氛围】", () => {

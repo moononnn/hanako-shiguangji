@@ -191,20 +191,41 @@ test("注入：普通特殊日子遵守档位节奏，不退化成每轮注入",
   assert.equal(always.should, true);
 });
 
-test("注入：配置节日问候的节日每轮都保留问候提醒", () => {
+test("注入：重大节日不突破当前档位重复注入", () => {
   const last = { lastInjectAt: D1.getTime(), lastDateKey: "2026-08-28", lastHash: "same" };
-  for (const mode of ["economical", "balanced"]) {
-    const result = shouldInject({
-      sessionId: "festival",
-      now: new Date(D1.getTime() + 1000),
-      mode,
-      lastState: last,
-      hasSpecialDay: true,
-      hasFestivalGreeting: true,
-    });
-    assert.equal(result.should, true, `${mode} 模式也要保留节日问候要求`);
-    assert.equal(result.reason, "festival-greeting");
-  }
+  const soon = new Date(D1.getTime() + 1000);
+  const economical = shouldInject({
+    sessionId: "festival",
+    now: soon,
+    mode: "economical",
+    lastState: last,
+    hasSpecialDay: true,
+  });
+  assert.equal(economical.should, false, "节日问候已随首次会话注入，不应每轮强制重注入");
+
+  const balanced = shouldInject({
+    sessionId: "festival",
+    now: soon,
+    mode: "balanced",
+    intervalHours: 4,
+    lastState: last,
+    hasSpecialDay: true,
+  });
+  assert.equal(balanced.should, false, "相伴模式仍遵守用户设定的注入间隔");
+});
+
+test("注入：未在回复中确认的节日问候会跨过档位间隔持续提醒", () => {
+  const last = { lastInjectAt: D1.getTime(), lastDateKey: "2026-08-28", lastHash: "same" };
+  const result = shouldInject({
+    sessionId: "festival-pending",
+    now: new Date(D1.getTime() + 1000),
+    mode: "balanced",
+    lastState: last,
+    hasSpecialDay: true,
+    hasPendingFestivalGreeting: true,
+  });
+  assert.equal(result.should, true);
+  assert.equal(result.reason, "festival-greeting-pending");
 });
 
 test("注入：省电模式无特殊日子不带", () => {

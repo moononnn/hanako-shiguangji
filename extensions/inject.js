@@ -16,7 +16,7 @@ import {
 } from "../lib/inject.js";
 import { selectRecentSummaries } from "../lib/recent-summaries.js";
 import { getBuiltinFestivals, isWorkday } from "../lib/festivals.js";
-import { FESTIVAL_HINTS, pickFestivalHint } from "../lib/festival-hints.js";
+import { FESTIVAL_HINTS, pickFestivalHint, didMentionFestival } from "../lib/festival-hints.js";
 import { finishedLifeDayKey, lifeDayKey, resolveSummaryAgentId } from "../lib/day-summary.js";
 import { readHanaUserName } from "../lib/user-name.js";
 import {
@@ -98,6 +98,60 @@ function persistInjectionState(data, sessionId, state) {
   data.setInjectionState(sessionId, state).catch(() => {});
 }
 
+function getAssistantVisibleText(message) {
+  const content = message?.content;
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return "";
+  return content.filter((part) => part?.type === "text").map((part) => part.text || "").join("\n");
+}
+
+function getActiveBranchAssistantTexts(context, afterTimestamp) {
+  const cutoff = Number(afterTimestamp);
+  if (!Number.isFinite(cutoff)) return [];
+  const manager = context?.sessionManager;
+  const entries = manager?.getEntries?.();
+  let entryId = manager?.getLeafId?.();
+  if (!Array.isArray(entries) || typeof entryId !== "string") return [];
+  const byId = new Map(entries.map((entry) => [entry?.id, entry]));
+  const texts = [];
+  let remaining = entries.length;
+  while (entryId && remaining-- > 0) {
+    const entry = byId.get(entryId);
+    if (!entry) break;
+    if (entry.type === "message" && entry.message?.role === "assistant") {
+      const timestamp = typeof entry.timestamp === "number" ? entry.timestamp : Date.parse(entry.timestamp);
+      if (Number.isFinite(timestamp) && timestamp > cutoff) {
+        texts.push(getAssistantVisibleText(entry.message));
+      }
+    }
+    entryId = typeof entry.parentId === "string" ? entry.parentId : null;
+  }
+  return texts;
+}
+
+function observeFestivalGreeting(pi) {
+  pi.on("message_end", (event, ctx) => {
+    try {
+      const message = event?.message;
+      // A generation can end on toolUse/aborted as well as final text; only normal or length-limited visible answers count.
+      if (message?.role !== "assistant" || !["stop", "length"].includes(message.stopReason)) return;
+      const sessionId = ctx?.sessionManager?.getSessionId?.() || null;
+      if (!sessionId) return;
+      const data = getData(ctx);
+      const state = tracker.get(sessionId) || data.getInjectionState(sessionId);
+      const name = state?.festivalGreetingName;
+      const date = state?.festivalGreetingPromptedDate;
+      if (!name || !date || state.festivalGreetingCompleteDate === date) return;
+      if (!didMentionFestival(getAssistantVisibleText(message), name)) return;
+      const completed = { ...state, festivalGreetingCompleteDate: date };
+      tracker.set(sessionId, completed);
+      persistInjectionState(data, sessionId, completed);
+    } catch {
+      // 观察回复失败不影响会话；未确认时保持待提醒，下一轮再自然提示。
+    }
+  });
+}
+
 // 峰谷判定状态异步落盘（fire-and-forget，复用 EncryptedStore 串行写队列，失败静默不影响对话）。
 function persistDeepSeekState(data, sessionId, dsState) {
   if (!data || !sessionId || !dsState) return;
@@ -128,6 +182,8 @@ export default function registerShiguangjiInject(pi) {
   } catch {
     // 启动写快照失败不影响插件加载
   }
+
+  observeFestivalGreeting(pi);
 
   pi.on("before_agent_start", (event, ctx) => {
     try {
@@ -211,6 +267,25 @@ export default function registerShiguangjiInject(pi) {
 
       // 收集当天情境。预计中的生理期不作为确定事实注入。
       const builtin = getBuiltinFestivals(now);
+      const todayKey = dateKeyOf(now);
+      let festivalGreetingCompleteToday = lastState?.festivalGreetingCompleteDate === todayKey;
+      // v0.2.135 只记“提示已注入”，升级时回看当前会话的活动分支；仅真实助手正文提过节日才迁移为完成。
+      const legacyPromptDate = lastState?.festivalGreetingDate;
+      const legacyFestivalName = builtin.find((f) => !!FESTIVAL_HINTS[f.name])?.name;
+      if (!festivalGreetingCompleteToday && legacyPromptDate === todayKey && legacyFestivalName) {
+        festivalGreetingCompleteToday = getActiveBranchAssistantTexts(ctx, lastState?.lastInjectAt)
+          .some((text) => didMentionFestival(text, legacyFestivalName));
+        if (festivalGreetingCompleteToday) {
+          lastState = { ...lastState, festivalGreetingCompleteDate: todayKey };
+          tracker.set(sessionId, lastState);
+          persistInjectionState(data, sessionId, lastState);
+        }
+      }
+      const hasPendingFestivalGreeting = builtin.some((f) => !!FESTIVAL_HINTS[f.name]) && !festivalGreetingCompleteToday;
+      // 只有从已完成回复中确认问候说出口后才从后续情境中收起节日信息。
+      const builtinForInjection = festivalGreetingCompleteToday
+        ? builtin.filter((f) => !FESTIVAL_HINTS[f.name])
+        : builtin;
       const userEvents = data.eventsOnDate(now).filter((e) => e.type !== "period");
       const periods = settings.showPeriod !== false
         ? data.periodsWithDayOn(now).filter((p) => !p.predicted).map((p) => p.event)
@@ -236,7 +311,7 @@ export default function registerShiguangjiInject(pi) {
       // 节日引导变体：读已用索引，预先 pick 一个未用过的（随机不重复）；注入成功后才回写
       let festivalHint = null;
       for (const f of builtin) {
-        if (!festivalHint && FESTIVAL_HINTS[f.name]) {
+        if (hasPendingFestivalGreeting && !festivalHint && FESTIVAL_HINTS[f.name]) {
           const used = data.getUsedFestivalHintIndexes(f.name);
           const picked = pickFestivalHint(f.name, used);
           if (picked) festivalHint = { name: f.name, text: picked.text, index: picked.index, nextUsed: picked.nextUsed };
@@ -259,7 +334,7 @@ export default function registerShiguangjiInject(pi) {
         intervalHours: settings.injectIntervalHours,
         lastState,
         hasSpecialDay,
-        hasFestivalGreeting: builtin.some((f) => !!FESTIVAL_HINTS[f.name]),
+        hasPendingFestivalGreeting,
         dayBoundaryHour: settings.dayBoundaryHour,
         contextKey,
         injectionEnabled: true,
@@ -336,7 +411,7 @@ export default function registerShiguangjiInject(pi) {
 
       const text = buildInjectionText({
         now,
-        builtinFestivals: builtin,
+        builtinFestivals: builtinForInjection,
         userEvents,
         periods,
         isWorkday: workday,
@@ -377,14 +452,18 @@ export default function registerShiguangjiInject(pi) {
 
       // 内容 hash 去重：同一会话同一内容不重复注入
       const hash = crypto.createHash("sha1").update(text).digest("hex");
-      if (lastState && lastState.lastHash === hash && !deepseekForced && decision.reason !== "day-changed" && decision.reason !== "settings-changed" && decision.reason !== "injection-enabled" && decision.reason !== "festival-greeting") {
+      if (lastState && lastState.lastHash === hash && !deepseekForced && decision.reason !== "day-changed" && decision.reason !== "settings-changed" && decision.reason !== "injection-enabled" && decision.reason !== "festival-greeting-pending") {
         const dedupedState = { ...decisionState, lastHash };
         tracker.set(sessionId, dedupedState);
         persistInjectionState(data, sessionId, dedupedState);
         return undefined;
       }
 
-      const finalState = { ...decisionState, lastHash: hash };
+      const finalState = {
+        ...decisionState,
+        lastHash: hash,
+        ...(festivalHint ? { festivalGreetingPromptedDate: todayKey, festivalGreetingName: festivalHint.name } : {}),
+      };
       tracker.set(sessionId, finalState);
       persistInjectionState(data, sessionId, finalState);
       persistDeepSeekState(data, sessionId, deepseekDecision.state);

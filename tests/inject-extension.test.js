@@ -46,6 +46,7 @@ test("扩展：注册 before_agent_start 处理器", () => {
   const pi = makePi();
   registerShiguangjiInject(pi);
   assert.equal(typeof pi._handlers["before_agent_start"], "function");
+  assert.equal(typeof pi._handlers["message_end"], "function", "应观察助手可见回复以确认问候是否完成");
 });
 
 test("扩展：无会话时返回 undefined（不注入）", () => {
@@ -69,6 +70,29 @@ test("扩展：关闭情境注入时不返回消息，重新打开后恢复", as
   assert.ok(restored?.message, "重新打开后下一轮应恢复注入");
   assert.equal(restored.message.display, false);
   assert.ok(restored.message.content.includes("今日时光"));
+  __setSharedUserDataForTest(new UserData(TEST_DATA_DIR));
+});
+
+test("扩展：伙伴级关闭只阻断指定伙伴，其他伙伴仍正常收到情境", async () => {
+  const data = new UserData(path.join(os.tmpdir(), `sgj-agent-disabled-ext-${Date.now()}-${Math.random().toString(36).slice(2)}`));
+  __setSharedUserDataForTest(data);
+  const now = new Date();
+  await data.addEvent({ title: "伙伴级开关测试日", type: "event", date: dateKey(now) });
+  await data.updateSettings({ injectionDisabledAgentIds: ["quiet-partner"] });
+  const pi = makePi();
+  registerShiguangjiInject(pi);
+  const handler = pi._handlers["before_agent_start"];
+  const disabled = handler({}, {
+    agentId: "quiet-partner",
+    sessionManager: { getSessionId: () => "quiet-partner-session" },
+  });
+  assert.equal(disabled, undefined, "指定伙伴关闭后不应收到情境");
+  const enabled = handler({}, {
+    agentId: "other-partner",
+    sessionManager: { getSessionId: () => "other-partner-session" },
+  });
+  assert.ok(enabled?.message, "未关闭的伙伴仍应收到情境");
+  assert.ok(enabled.message.content.includes("伙伴级开关测试日"));
   __setSharedUserDataForTest(new UserData(TEST_DATA_DIR));
 });
 
@@ -188,6 +212,112 @@ test("扩展：注入失败不抛错（数据目录不可写也安全）", async
     threw = true;
   }
   assert.equal(threw, false, "不应抛错");
+});
+
+test("扩展：节日问候保持待完成直到助手可见回复提到节日", async () => {
+  const dir = path.join(os.tmpdir(), `sgj-festival-pending-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+  const data = new UserData(dir);
+  __setSharedUserDataForTest(data);
+  let now = new Date("2026-09-25T09:00:00+08:00");
+  __setInjectNowForTest(() => now);
+  await data.updateSettings({ injectMode: "always" });
+  try {
+    const ctx = { sessionManager: { getSessionId: () => "festival-pending-session" } };
+    const pi = makePi();
+    registerShiguangjiInject(pi);
+    const first = pi._handlers["before_agent_start"]({}, ctx);
+    assert.ok(first?.message, "节日首次开场应注入情境");
+    assert.ok(first.message.content.includes("【节日问候要求】"), first.message.content);
+
+    // 工具调用中的助手中间消息，即使含节日词，也不能算已问候完成。
+    pi._handlers["message_end"]({ type: "message_end", message: { role: "assistant", stopReason: "toolUse", content: [{ type: "text", text: "中秋快乐，先让我查一下。" }] } }, ctx);
+    await data.addEvent({ title: "同日新建的情境", type: "event", date: dateKey(now) });
+    const pending = pi._handlers["before_agent_start"]({}, ctx);
+    assert.ok(pending?.message, "中间工具消息后，问候仍待完成");
+    assert.ok(pending.message.content.includes("【节日问候要求】"), pending.message.content);
+
+    // 被中断的回答也不能标记完成。
+    pi._handlers["message_end"]({ type: "message_end", message: { role: "assistant", stopReason: "aborted", content: [{ type: "text", text: "中秋月饼" }] } }, ctx);
+    await data.addEvent({ title: "中断后新建的情境", type: "event", date: dateKey(now) });
+    const stillPending = pi._handlers["before_agent_start"]({}, ctx);
+    assert.ok(stillPending?.message?.content.includes("【节日问候要求】"), "中断回答后仍继续提醒");
+
+    pi._handlers["message_end"]({ type: "message_end", message: { role: "assistant", stopReason: "stop", content: [{ type: "text", text: "中秋快乐呀，桂花香想起来就很清甜。" }] }, }, ctx);
+    await data.addEvent({ title: "问候完成后的情境", type: "event", date: dateKey(now) });
+    const completed = pi._handlers["before_agent_start"]({}, ctx);
+    assert.ok(completed?.message, "其他情境变化仍应照常触发注入");
+    assert.ok(!completed.message.content.includes("【节日问候要求】"), completed.message.content);
+    assert.ok(!completed.message.content.includes("今天是：中秋节"), "已实际问候的节日不应被主动重提");
+
+    await data.injectionState.update(() => {});
+    __clearInjectTrackersForTest();
+    const dataAfterRestart = new UserData(dir);
+    __setSharedUserDataForTest(dataAfterRestart);
+    await dataAfterRestart.addEvent({ title: "重启后新建的情境", type: "event", date: dateKey(now) });
+    const piAfterRestart = makePi();
+    registerShiguangjiInject(piAfterRestart);
+    const resumed = piAfterRestart._handlers["before_agent_start"]({}, ctx);
+    assert.ok(resumed?.message, "重启后其他情境变化仍应照常触发注入");
+    assert.ok(!resumed.message.content.includes("【节日问候要求】"), "重启后应恢复已经问候的状态");
+
+    const fresh = piAfterRestart._handlers["before_agent_start"]({}, {
+      sessionManager: { getSessionId: () => "festival-pending-new-session" },
+    });
+    assert.ok(fresh?.message, "新聊天框开场仍应注入节日问候");
+    assert.ok(fresh.message.content.includes("【节日问候要求】"), fresh.message.content);
+
+    // 升级兼容：上一版只记“提示已注入”；仅活动分支历史中确实有节日意象时才迁移为完成。
+    const legacySessionId = "festival-pending-legacy-session";
+    await dataAfterRestart.setInjectionState(legacySessionId, {
+      lastInjectAt: now.getTime(),
+      lastDateKey: dateKey(now),
+      lastHash: "legacy",
+      festivalGreetingDate: dateKey(now),
+      injectionEnabled: true,
+    });
+    const legacy = piAfterRestart._handlers["before_agent_start"]({}, {
+      sessionManager: {
+        getSessionId: () => legacySessionId,
+        getEntries: () => [{ id: "legacy-assistant", parentId: null, type: "message", timestamp: new Date(now.getTime() + 1000).toISOString(), message: { role: "assistant", content: [{ type: "text", text: "中秋快乐，桂花很香。" }] } }],
+        getLeafId: () => "legacy-assistant",
+      },
+    });
+    assert.ok(legacy?.message, "升级兼容时仍可注入其他情境");
+    assert.ok(!legacy.message.content.includes("【节日问候要求】"), "旧会话历史确有问候时不应重复");
+
+    const legacyPendingId = "festival-pending-legacy-no-greeting";
+    await dataAfterRestart.setInjectionState(legacyPendingId, {
+      lastInjectAt: now.getTime(),
+      lastDateKey: dateKey(now),
+      lastHash: "legacy-no-greeting",
+      festivalGreetingDate: dateKey(now),
+      injectionEnabled: true,
+    });
+    const legacyPending = piAfterRestart._handlers["before_agent_start"]({}, {
+      sessionManager: {
+        getSessionId: () => legacyPendingId,
+        getEntries: () => [
+          { id: "old-branch", parentId: null, type: "message", timestamp: now.getTime() + 2000, message: { role: "assistant", content: [{ type: "text", text: "中秋快乐，桂花很香。" }] } },
+          { id: "cutoff-assistant", parentId: "old-current-assistant", type: "message", timestamp: now.getTime(), message: { role: "assistant", content: [{ type: "text", text: "中秋快乐。" }] } },
+          { id: "invalid-timestamp", parentId: "missing-timestamp", type: "message", timestamp: "not-a-timestamp", message: { role: "assistant", content: [{ type: "text", text: "中秋快乐。" }] } },
+          { id: "missing-timestamp", parentId: "cutoff-assistant", type: "message", message: { role: "assistant", content: [{ type: "text", text: "中秋快乐。" }] } },
+          { id: "old-current-assistant", parentId: "old-current-user", type: "message", timestamp: now.getTime() - 1000, message: { role: "assistant", content: [{ type: "text", text: "中秋节的来历很有意思。" }] } },
+          { id: "old-current-user", parentId: null, type: "message", timestamp: now.getTime() - 2000, message: { role: "user", content: [{ type: "text", text: "怎么回事？" }] } },
+          { id: "legacy-current-response", parentId: "invalid-timestamp", type: "message", timestamp: new Date(now.getTime() + 1000).toISOString(), message: { role: "assistant", content: [{ type: "text", text: "报错原因已经查清了。" }] } },
+        ],
+        getLeafId: () => "legacy-current-response",
+      },
+    });
+    assert.ok(legacyPending?.message?.content.includes("【节日问候要求】"), "旧分支话题和提示前的提及都不应替代实际问候");
+
+    now = new Date("2027-09-15T09:00:00+08:00");
+    const nextFestivalDay = piAfterRestart._handlers["before_agent_start"]({}, ctx);
+    assert.ok(nextFestivalDay?.message, "跨到下一年节日日期后仍照常刷新");
+    assert.ok(nextFestivalDay.message.content.includes("【节日问候要求】"), nextFestivalDay.message.content);
+  } finally {
+    __setInjectNowForTest(null);
+    __setSharedUserDataForTest(new UserData(TEST_DATA_DIR));
+  }
 });
 
 test("扩展：DeepSeek 换班窗口前首次识别硬触发，同一时段不重复", () => {
