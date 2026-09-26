@@ -298,13 +298,13 @@ test("路由：情境注入与天气开关独立保存，关闭天气不查询�
       json(value) { return value; },
     });
     const region = { code: "510107" };
-    const saved = await callSettings({ injectionEnabled: false, weatherEnabled: false, weatherArea: region });
-    if (!saved.ok || saved.settings.injectionEnabled !== false || saved.settings.weatherEnabled !== false) {
-      throw new Error("两个开关没有独立保存：" + JSON.stringify(saved));
+    const saved = await callSettings({ injectionEnabled: false, injectionDisabledAgentIds: ["quiet-partner", "quiet-partner"], weatherEnabled: false, weatherArea: region });
+    if (!saved.ok || saved.settings.injectionEnabled !== false || saved.settings.weatherEnabled !== false || JSON.stringify(saved.settings.injectionDisabledAgentIds) !== JSON.stringify(["quiet-partner"])) {
+      throw new Error("注入伙伴和天气开关没有独立保存：" + JSON.stringify(saved));
     }
     const loaded = await getSettings.handler({ json(value) { return value; } });
-    if (loaded.settings.injectionEnabled !== false || loaded.settings.weatherEnabled !== false) {
-      throw new Error("两个开关没有正确回读：" + JSON.stringify(loaded));
+    if (loaded.settings.injectionEnabled !== false || loaded.settings.weatherEnabled !== false || JSON.stringify(loaded.settings.injectionDisabledAgentIds) !== JSON.stringify(["quiet-partner"])) {
+      throw new Error("开关没有正确回读：" + JSON.stringify(loaded));
     }
     await data.setWeatherCache({
       location: "四川省 成都市 武侯区",

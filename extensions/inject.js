@@ -137,7 +137,12 @@ export default function registerShiguangjiInject(pi) {
       const data = getData(ctx);
       const settings = data.getSettings();
       const now = nowProvider();
-      const injectionEnabled = settings.injectionEnabled !== false;
+      const currentAgentId = resolveAgentId(event, ctx);
+      const disabledAgentIds = new Set(Array.isArray(settings.injectionDisabledAgentIds)
+        ? settings.injectionDisabledAgentIds.map((id) => String(id))
+        : []);
+      const partnerInjectionDisabled = !!currentAgentId && disabledAgentIds.has(currentAgentId);
+      const injectionEnabled = settings.injectionEnabled !== false && !partnerInjectionDisabled;
       const currentModel = resolveCurrentModel(event, ctx);
       const dataRev = data.getDataRev();
       // 对外快照独立于「情境注入」开关：那个开关只管往 Hana 会话里注入，
@@ -172,7 +177,7 @@ export default function registerShiguangjiInject(pi) {
         logContextKeyChange(sessionId, lastState.contextKey, contextKey);
       }
 
-      // 关闭只阻断助手情境，不读取日子/总结，也不影响日历与时光册。
+      // 全局关闭或当前伙伴单独关闭时，只阻断对话注入，不影响日历与时光册。
       if (!injectionEnabled) {
         const disabledDecision = shouldInject({
           sessionId,
@@ -301,12 +306,12 @@ export default function registerShiguangjiInject(pi) {
 
       // 近期总结：先按当前伙伴身份做权限过滤，再取最近 3 个已结束生活日；
       // 更老档案只在当前话题有词汇关联时渐进式展开。没有可靠身份时默认不带任何总结。
-      const currentAgentId = resolveSummaryAgentId(getAgentsDir(), resolveAgentId(event, ctx));
+      const summaryAgentId = resolveSummaryAgentId(getAgentsDir(), currentAgentId);
       const userName = readHanaUserName() || "对方";
       const recent = selectRecentSummaries(data.listSummaryEntries(), {
         now,
         boundaryHour: settings.dayBoundaryHour,
-        currentAgentId,
+        currentAgentId: summaryAgentId,
         shared: settings.summaryShared === true,
         prompt: extractPrompt(event),
       });
@@ -339,7 +344,7 @@ export default function registerShiguangjiInject(pi) {
         summary: null,
         recentSummaries: recent.entries,
         recentSummaryOptions: {
-          currentAgentId,
+          currentAgentId: summaryAgentId,
           shared: settings.summaryShared === true,
           proactiveDate: finishedLifeDayKey(now, settings.dayBoundaryHour),
           userName,
@@ -414,6 +419,9 @@ function buildInjectionContextKey(settings = {}) {
     summaryShared: settings.summaryShared === true,
     weatherEnabled: settings.weatherEnabled !== false,
     weatherLocation: settings.weatherLocation || "",
+    injectionDisabledAgentIds: Array.isArray(settings.injectionDisabledAgentIds)
+      ? [...settings.injectionDisabledAgentIds].map(String).sort()
+      : [],
   });
 }
 

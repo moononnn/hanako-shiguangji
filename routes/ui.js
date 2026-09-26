@@ -533,6 +533,7 @@ function makeSettingsStore() {
 function publicSettings(s) {
   return {
     injectionEnabled: s.injectionEnabled !== false,
+    injectionDisabledAgentIds: Array.isArray(s.injectionDisabledAgentIds) ? s.injectionDisabledAgentIds.map((id) => String(id)) : [],
     injectMode: s.injectMode,
     injectIntervalHours: s.injectIntervalHours,
     autoSummary: s.autoSummary,
@@ -1047,6 +1048,14 @@ export default function registerRoutes(app, ctx) {
     try {
       const patch = {};
       if (body.injectionEnabled !== undefined) patch.injectionEnabled = !!body.injectionEnabled;
+      if (body.injectionDisabledAgentIds !== undefined) {
+        if (!Array.isArray(body.injectionDisabledAgentIds)) {
+          return c.json({ ok: false, error: "伙伴情境开关格式不对" });
+        }
+        patch.injectionDisabledAgentIds = [...new Set(body.injectionDisabledAgentIds
+          .map((id) => String(id || "").trim())
+          .filter(Boolean))];
+      }
       if (body.injectMode !== undefined) {
         if (!["economical", "balanced", "always"].includes(body.injectMode)) {
           return c.json({ ok: false, error: "注入模式不对" });
