@@ -1052,32 +1052,36 @@ test("节假日：假期日带上第几天/共几天（防模型脑补成第一�
   assert.equal(fest.holidayDay, undefined, "正日子不该有 holidayDay");
 });
 
-test("注入文本：假期第 3 天说成最后一天，不说第一天", () => {
-  const f = getBuiltinFestivals(new Date(2026, 8, 27, 14, 0, 0)).find((x) => x.name === "中秋节假期");
-  const hint = pickFestivalHint(f.name, []);
-  const text = buildInjectionText({
-    now: new Date(2026, 8, 27, 14, 0, 0),
-    festivals: [f],
-    festivalHint: { name: f.name, text: hint.text, dayInfo: { baseName: f.baseName, holidayDay: f.holidayDay, holidayTotal: f.holidayTotal } },
-    force: true,
-  });
-  assert.ok(text.includes("中秋节假期第 3 天（共 3 天）"), text);
-  assert.ok(text.includes("今天是假期最后一天"), text);
-  assert.ok(text.includes("严禁说成第一天"), text);
+test("注入文本：假期中间/末尾都不提最后一天、倒计时、第一天", () => {
+  for (const [day, tag] of [[26, "第2天"], [27, "第3天"]]) {
+    const f = getBuiltinFestivals(new Date(2026, 8, day, 14, 0, 0)).find((x) => x.name === "中秋节假期");
+    const hint = pickFestivalHint(f.name, []);
+    const text = buildInjectionText({
+      now: new Date(2026, 8, day, 14, 0, 0),
+      festivals: [f],
+      festivalHint: { name: f.name, text: hint.text, dayInfo: { baseName: f.baseName, holidayDay: f.holidayDay, holidayTotal: f.holidayTotal } },
+      force: true,
+    });
+    const dayLine = text.split("\n").find((l) => l.startsWith("【节日氛围】")) || "";
+    assert.ok(dayLine.startsWith("【节日氛围】今天是中秋节假期。"), `${tag} 应只说在假期里：${dayLine}`);
+    assert.ok(!/最后一天|明天上班|共\s*\d+\s*天|第\s*\d+\s*天|快过完|结束了/.test(dayLine),
+      `${tag} 当日断言句不该出现倒计时/收尾措辞：${dayLine}`);
+    assert.ok(text.includes("严禁说成放假第一天"), text);
+  }
 });
 
-test("注入文本：假期第 2 天提明天就是最后一天", () => {
-  const f = getBuiltinFestivals(new Date(2026, 8, 26, 14, 0, 0)).find((x) => x.name === "中秋节假期");
-  const hint = pickFestivalHint(f.name, []);
-  const text = buildInjectionText({
-    now: new Date(2026, 8, 26, 14, 0, 0),
-    festivals: [f],
-    festivalHint: { name: f.name, text: hint.text, dayInfo: { baseName: f.baseName, holidayDay: f.holidayDay, holidayTotal: f.holidayTotal } },
-    force: true,
-  });
-  assert.ok(text.includes("中秋节假期第 2 天（共 3 天）"), text);
-  assert.ok(text.includes("明天就是假期最后一天"), text);
-  assert.ok(!text.includes("今天是假期最后一天"), "第 2 天不应说成今天是最后一天: " + text);
+test("注入文本：假期第一天才提「刚开始」，且不说节日当天", () => {
+  const f = getBuiltinFestivals(new Date(2026, 8, 24, 14, 0, 0)).find((x) => x.name === "中秋节假期");
+  if (f && f.holidayDay === 1) {
+    const hint = pickFestivalHint(f.name, []);
+    const text = buildInjectionText({
+      now: new Date(2026, 8, 24, 14, 0, 0),
+      festivals: [f],
+      festivalHint: { name: f.name, text: hint.text, dayInfo: { baseName: f.baseName, holidayDay: f.holidayDay, holidayTotal: f.holidayTotal } },
+      force: true,
+    });
+    assert.ok(text.includes("假期刚开始"), text);
+  }
 });
 
 test("节日问候判定：假期名回落到节日本名（否则提示会每轮重复注入）", () => {
