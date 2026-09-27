@@ -16,7 +16,7 @@ import {
 } from "../lib/inject.js";
 import { selectRecentSummaries } from "../lib/recent-summaries.js";
 import { getBuiltinFestivals, isWorkday } from "../lib/festivals.js";
-import { FESTIVAL_HINTS, pickFestivalHint, didMentionFestival } from "../lib/festival-hints.js";
+import { getFestivalHintPool, pickFestivalHint, didMentionFestival } from "../lib/festival-hints.js";
 import { finishedLifeDayKey, lifeDayKey, resolveSummaryAgentId } from "../lib/day-summary.js";
 import { readHanaUserName } from "../lib/user-name.js";
 import {
@@ -271,7 +271,7 @@ export default function registerShiguangjiInject(pi) {
       let festivalGreetingCompleteToday = lastState?.festivalGreetingCompleteDate === todayKey;
       // v0.2.135 只记“提示已注入”，升级时回看当前会话的活动分支；仅真实助手正文提过节日才迁移为完成。
       const legacyPromptDate = lastState?.festivalGreetingDate;
-      const legacyFestivalName = builtin.find((f) => !!FESTIVAL_HINTS[f.name])?.name;
+      const legacyFestivalName = builtin.find((f) => !!getFestivalHintPool(f.name))?.name;
       if (!festivalGreetingCompleteToday && legacyPromptDate === todayKey && legacyFestivalName) {
         festivalGreetingCompleteToday = getActiveBranchAssistantTexts(ctx, lastState?.lastInjectAt)
           .some((text) => didMentionFestival(text, legacyFestivalName));
@@ -281,10 +281,10 @@ export default function registerShiguangjiInject(pi) {
           persistInjectionState(data, sessionId, lastState);
         }
       }
-      const hasPendingFestivalGreeting = builtin.some((f) => !!FESTIVAL_HINTS[f.name]) && !festivalGreetingCompleteToday;
+      const hasPendingFestivalGreeting = builtin.some((f) => !!getFestivalHintPool(f.name)) && !festivalGreetingCompleteToday;
       // 只有从已完成回复中确认问候说出口后才从后续情境中收起节日信息。
       const builtinForInjection = festivalGreetingCompleteToday
-        ? builtin.filter((f) => !FESTIVAL_HINTS[f.name])
+        ? builtin.filter((f) => !getFestivalHintPool(f.name))
         : builtin;
       const userEvents = data.eventsOnDate(now).filter((e) => e.type !== "period");
       const periods = settings.showPeriod !== false
@@ -311,10 +311,10 @@ export default function registerShiguangjiInject(pi) {
       // 节日引导变体：读已用索引，预先 pick 一个未用过的（随机不重复）；注入成功后才回写
       let festivalHint = null;
       for (const f of builtin) {
-        if (hasPendingFestivalGreeting && !festivalHint && FESTIVAL_HINTS[f.name]) {
+        if (hasPendingFestivalGreeting && !festivalHint && getFestivalHintPool(f.name)) {
           const used = data.getUsedFestivalHintIndexes(f.name);
           const picked = pickFestivalHint(f.name, used);
-          if (picked) festivalHint = { name: f.name, text: picked.text, index: picked.index, nextUsed: picked.nextUsed };
+          if (picked) festivalHint = { name: f.name, text: picked.text, index: picked.index, nextUsed: picked.nextUsed, dayInfo: { baseName: f.baseName, holidayDay: f.holidayDay, holidayTotal: f.holidayTotal } };
           break;
         }
       }

@@ -22,6 +22,7 @@ import {
 } from "../lib/inject.js";
 import { decideDeepSeekNotice, getDeepSeekTimeInfo, isDeepSeekModel } from "../lib/deepseek-peak.js";
 import { getBuiltinFestivals, isWorkday, isLegalHoliday, getMonthFestivals } from "../lib/festivals.js";
+import { getFestivalHintPool, pickFestivalHint, didMentionFestival } from "../lib/festival-hints.js";
 import {
   UserData,
   dateKey,
@@ -1030,6 +1031,61 @@ test("节假日：假期区间不等于节日当天（中秋假期第 2/3 天不
     assert.equal(f.filter((x) => x.name === "中秋节").length, 0, `9-${day} 不应报中秋节：${JSON.stringify(f)}`);
     assert.ok(f.some((x) => x.name === "中秋节假期"), `9-${day} 应报中秋节假期：${JSON.stringify(f)}`);
   }
+});
+
+test("节假日：假期日带上第几天/共几天（防模型脑补成第一天）", () => {
+  const d1 = getBuiltinFestivals(new Date(2026, 8, 26)).find((x) => x.name === "中秋节假期");
+  const d3 = getBuiltinFestivals(new Date(2026, 8, 27)).find((x) => x.name === "中秋节假期");
+  assert.equal(d1.holidayDay, 2, `9-26 应是第 2 天：${JSON.stringify(d1)}`);
+  assert.equal(d1.holidayTotal, 3, `9-26 共 3 天：${JSON.stringify(d1)}`);
+  assert.equal(d1.baseName, "中秋节");
+  assert.equal(d3.holidayDay, 3, `9-27 应是第 3 天：${JSON.stringify(d3)}`);
+  assert.equal(d3.holidayTotal, 3, `9-27 共 3 天：${JSON.stringify(d3)}`);
+
+  // 春节 9 天也要数对
+  const c = getBuiltinFestivals(new Date(2026, 1, 22)).find((x) => x.name === "春节假期");
+  assert.equal(c.holidayDay, 8, `2-22 应是第 8 天：${JSON.stringify(c)}`);
+  assert.equal(c.holidayTotal, 9, `春节共 9 天：${JSON.stringify(c)}`);
+
+  // 正日子不挂假期天数字段
+  const fest = getBuiltinFestivals(new Date(2026, 8, 25)).find((x) => x.name === "中秋节");
+  assert.equal(fest.holidayDay, undefined, "正日子不该有 holidayDay");
+});
+
+test("注入文本：假期第 3 天说成最后一天，不说第一天", () => {
+  const f = getBuiltinFestivals(new Date(2026, 8, 27, 14, 0, 0)).find((x) => x.name === "中秋节假期");
+  const hint = pickFestivalHint(f.name, []);
+  const text = buildInjectionText({
+    now: new Date(2026, 8, 27, 14, 0, 0),
+    festivals: [f],
+    festivalHint: { name: f.name, text: hint.text, dayInfo: { baseName: f.baseName, holidayDay: f.holidayDay, holidayTotal: f.holidayTotal } },
+    force: true,
+  });
+  assert.ok(text.includes("中秋节假期第 3 天（共 3 天）"), text);
+  assert.ok(text.includes("今天是假期最后一天"), text);
+  assert.ok(text.includes("严禁说成第一天"), text);
+});
+
+test("注入文本：假期第 2 天提明天就是最后一天", () => {
+  const f = getBuiltinFestivals(new Date(2026, 8, 26, 14, 0, 0)).find((x) => x.name === "中秋节假期");
+  const hint = pickFestivalHint(f.name, []);
+  const text = buildInjectionText({
+    now: new Date(2026, 8, 26, 14, 0, 0),
+    festivals: [f],
+    festivalHint: { name: f.name, text: hint.text, dayInfo: { baseName: f.baseName, holidayDay: f.holidayDay, holidayTotal: f.holidayTotal } },
+    force: true,
+  });
+  assert.ok(text.includes("中秋节假期第 2 天（共 3 天）"), text);
+  assert.ok(text.includes("明天就是假期最后一天"), text);
+  assert.ok(!text.includes("今天是假期最后一天"), "第 2 天不应说成今天是最后一天: " + text);
+});
+
+test("节日问候判定：假期名回落到节日本名（否则提示会每轮重复注入）", () => {
+  assert.equal(getFestivalHintPool("中秋节假期") !== null, true, "假期名应能取到意象池");
+  assert.equal(getFestivalHintPool("中秋节") !== null, true);
+  assert.equal(getFestivalHintPool("9月28日"), null, "非节日名不该有池");
+  assert.equal(didMentionFestival("我今天吃了个月饼", "中秋节假期"), true);
+  assert.equal(didMentionFestival("今天天气不错", "中秋节假期"), false);
 });
 
 test("节假日：春节/国庆同理，只有正日子报节日名", () => {
